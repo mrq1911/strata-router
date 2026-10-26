@@ -39,7 +39,7 @@ STRATA_BACKENDS="a=10.0.0.1:8080,b=10.0.0.2:8080" node router.mjs
 | `MAX_QUEUE_WAIT` | `30000` | how long to wait for a free slot before handing the request to an engine's own queue |
 | `PREFILL_TOK_S` | `1400` | cold prefill speed until an engine's own is measured; decides how long a conversation waits for its busy home |
 | `CONNECT_TIMEOUT` | `10000` | TCP connect timeout to an engine; a failed connect marks it unhealthy until the next good poll |
-| `READ_TIMEOUT` | `300000` | idle timeout on an engine response (long prefills need it) |
+| `READ_TIMEOUT` | `300000` | how long an engine may stay silent before the router checks on it (see routing rules) |
 | `MAX_CONVERSATIONS` | `500` | size of the conversation map (LRU) |
 | `PASSTHROUGH` | all | comma-separated POST paths the router relays to the engine; anything else gets 404 |
 | `STATE_FILE` | none | keeps conversation homes across restarts (written every minute and on shutdown) |
@@ -52,7 +52,7 @@ a bad value stops the router at startup with a message naming it, rather than ro
 
 | path | behaviour |
 |---|---|
-| `POST /v1/chat/completions` | routed; SSE streamed untouched; response carries `x-strata-backend` |
+| `POST /v1/chat/completions` | routed; SSE streamed untouched; client headers (auth included) passed on; response carries `x-strata-backend` |
 | `POST /v1/completions` | same routing, keyed on the prompt prefix |
 | `POST /v1/messages` | same routing (Anthropic-style payloads) |
 | `POST /v1/responses` | same routing (OpenAI Responses-style) |
@@ -65,26 +65,33 @@ a bad value stops the router at startup with a message naming it, rather than ro
 ## routing rules
 
 - **conversation key** = hash of `model | system prompt | first user message` (first 4k chars; the prompt prefix
-  for `/v1/completions`). Forks and branches of a conversation share the key, so they inherit the same home
-  engine and reuse the prefix cache.
+  for `/v1/completions`; the raw content when the opener has no text, e.g. a lone image). Forks and branches of
+  a conversation share the key, so they inherit the same home engine and reuse the prefix cache.
 - **sticky** while the home engine is healthy, has an empty queue and a free batch slot.
 - **healthy** until `POLL_FAILS` polls in a row time out or fail, so an engine too busy prefilling to answer
   `/metrics` quickly keeps its conversations. A refused connection, a non-200 `/metrics` or a request that can't
   connect marks it down at once.
 - **patient** when the home is busy: wait for its slot as long as a cold prefill of the conversation would take
-  elsewhere (last turn's prompt tokens ÷ the fastest other engine's prefill speed, capped at `MAX_QUEUE_WAIT`).
-  Prefill speed is measured per engine from streamed turns with at least 1,000 uncached prompt tokens, starting
-  from `PREFILL_TOK_S`. New conversations don't wait.
+  elsewhere (last turn's prompt tokens ÷ the fastest other engine's prefill speed, capped at `MAX_QUEUE_WAIT`),
+  and hold the home's next free slot against newcomers meanwhile. Prefill speed is measured per engine from
+  streamed turns with at least 1,000 uncached prompt tokens, starting from `PREFILL_TOK_S`; without usage in the
+  answers, the prompt size is estimated from the request. New conversations don't wait.
 - **spill** to the least-loaded engine with a free slot after that, or right away when the home is down; the home
   moves with the conversation.
-- **queue** up to `MAX_QUEUE_WAIT` when every engine is full, first come first served, then hand the request to
-  the home engine's own queue.
-- **fail fast** with 503 when no engine has been healthy for a poll interval, instead of queueing.
-- **retry** once on another engine for connect errors, connect timeouts and 5xx answers, only while nothing has
-  reached the client. Once the response has started, an engine failure cuts the client connection, so a
-  truncated answer shows up as an error rather than a short reply. With nowhere to retry, the engine's own
-  error is passed on.
-- **cancel**: a client that disconnects aborts the engine request and frees its slot.
+- **queue** up to `MAX_QUEUE_WAIT` when every engine is full, in arrival order, then hand the request to the home
+  engine's own queue.
+- **fail fast** with 503 once no engine has been healthy for a poll interval, instead of queueing.
+- **retry** on another engine, queueing for it like any request, when the engine never started an answer: it
+  refused or timed out the connection, reset it before answering, or answered 5xx. Once a response has started,
+  an engine failure cuts the client connection, so a truncated answer shows up as an error rather than a short
+  reply. With nowhere to retry, the engine's own error is passed on.
+- **silence** is not failure: when an engine says nothing for `READ_TIMEOUT`, the request keeps waiting as long as
+  the engine still reports work in `/metrics` (long prefills and non-streamed answers can be silent for minutes).
+  It is given up only when the engine is idle or down, and then retried elsewhere if nothing reached the client
+  yet (504 otherwise). A request whose answer hasn't reached the client moves as soon as polls give its engine
+  up, without sitting out `READ_TIMEOUT`; one already streaming is left to finish or time out.
+- **cancel**: a client that disconnects aborts the engine request and frees its slot, pipelined requests included.
+- **paths** with a trailing or doubled slash route like the canonical ones.
 
 ## what the metrics mean
 
@@ -98,7 +105,8 @@ a bad value stops the router at startup with a message naming it, rather than ro
 - `poll_fails` — failed polls in a row
 
 and globally: `cold` (new conversations, i.e. prefills), `migrated` (conversations whose home moved), `queued`
-(requests that waited for a slot), `overflow` (handed to a full engine after `MAX_QUEUE_WAIT`), `retried`, and
+(requests that waited for a slot), `waiting` (waiting right now), `overflow` (handed to a full engine after
+`MAX_QUEUE_WAIT`), `retried`, and
 `cached_tokens / prompt_tokens` — the ratio you should actually watch. Usage is read from JSON and SSE answers in
 chat, messages and responses shapes. A healthy setup has almost as many cold events as conversations, not as
 many as turns.
@@ -115,8 +123,10 @@ journalctl -u strata-router -f
 
 the unit runs as a dynamic user and keeps conversation homes in `/var/lib/strata-router`.
 
-on SIGTERM the router stops taking requests and lets the answers in flight finish for up to `SHUTDOWN_GRACE`;
-a second signal exits at once. systemd's default 90 s stop timeout covers the default grace.
+on SIGTERM the router saves conversation homes, stops accepting connections (requests on open ones get 503) and
+lets the answers in flight reach their clients for up to `SHUTDOWN_GRACE`, then gives clients a second to finish
+reading before the connections drop; a second signal exits at once. systemd's default 90 s stop timeout covers
+the default grace.
 
 ## docker
 

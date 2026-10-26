@@ -5,6 +5,7 @@
 // node >= 20, no dependencies.
 
 import http from 'node:http';
+import net from 'node:net';
 import fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import { dirname } from 'node:path';
@@ -59,8 +60,8 @@ function parseBackends(spec) {
   if (!entries.length) problems.push('STRATA_BACKENDS: no engines configured');
   const backends = [];
   for (const entry of entries) {
-    // "name=host:port" or "host:port", ipv6 as [::1]:port
-    const m = entry.match(/^(?:([^=\s]+)=)?(\[[0-9a-fA-F:.]+\]|[^\s:=[\]]+)(?::(\d{1,5}))?$/);
+    // "name=host:port" or "host:port", ipv6 as [::1]:port; names end up in a response header, so ascii only
+    const m = entry.match(/^(?:([\x21-\x3c\x3e-\x7e]+)=)?(\[[0-9a-fA-F:.]+\]|[\w.-]+)(?::(\d{1,5}))?$/);
     const port = Number(m?.[3] || 8080);
     if (!m || port < 1 || port > 65535) {
       problems.push(`STRATA_BACKENDS entry "${entry}": expected host:port or name=host:port`);
@@ -77,6 +78,7 @@ function parseBackends(spec) {
       running: 0,
       queued: 0,
       inflight: 0,
+      flights: new Set(),
       batch: 2,
       tok_s_mean: null,
       prefill_tok_s: null,
@@ -100,6 +102,8 @@ const addr = (b) => (b.host.includes(':') ? `[${b.host}]:${b.port}` : `${b.host}
 const ROUTED = new Set(['/v1/chat/completions', '/v1/completions', '/v1/messages', '/v1/responses']);
 const LOCAL = new Set(['/', '/health', '/stats']);
 const HOP = new Set(['connection', 'keep-alive', 'transfer-encoding', 'te', 'trailer', 'upgrade', 'proxy-authenticate', 'proxy-authorization']);
+// expect would stall the upstream request; accept-encoding would compress answers the router has to read
+const NOT_FORWARDED = new Set(['host', 'content-length', 'expect', 'accept-encoding']);
 const MAX_BODY = 20_000_000;
 // a fresh connection per request, so a stale keep-alive socket can't fail (and spill) a turn
 const agent = new http.Agent({ keepAlive: false });
@@ -120,6 +124,8 @@ const stats = {
 };
 
 const log = (msg) => { if (config.verbose) console.log(new Date().toISOString().slice(11, 23), msg); };
+// a refused localhost connect is an AggregateError with an empty message
+const errText = (err) => String(err?.message || err?.code || err);
 
 function getJson(b, path, timeout = 5000) {
   return new Promise((resolve, reject) => {
@@ -139,6 +145,10 @@ function getJson(b, path, timeout = 5000) {
   });
 }
 
+let lastHealthyAt = -Infinity;
+
+const busy = (b) => b.running > 0 || b.queued > 0 || b.slots.some((s) => s?.state && s.state !== 'idle');
+
 async function pollOne(b) {
   try {
     const m = await getJson(b, '/metrics');
@@ -147,19 +157,24 @@ async function pollOne(b) {
     b.fails = 0;
     b.lastError = null;
     b.lastPoll = Date.now();
-    b.slots = live.slots || [];
+    b.slots = Array.isArray(live.slots) ? live.slots : [];
     b.running = live.running || 0;
     b.queued = live.queued || 0;
     b.batch = m.engine?.batch_slots ?? 2;
     b.tok_s_mean = live.tok_s_mean ?? null;
-    b.held_tokens = b.slots.reduce((s, x) => s + (x.held_tokens || 0), 0);
+    b.held_tokens = b.slots.reduce((s, x) => s + (x?.held_tokens || 0), 0);
     b.vram_free_mib = m.engine?.vram_free_mib ?? 0;
     b.cache = m.conversation_cache || null;
+    lastHealthyAt = performance.now();
   } catch (err) {
-    b.lastError = String(err.message || err);
-    // an answer or a refused connection is final; a timeout may just be an engine busy prefilling
     b.fails++;
-    if (err.definite || err.code === 'ECONNREFUSED' || b.fails >= config.pollFails) b.healthy = false;
+    b.lastError = errText(err);
+    // an answer or a refused connection is final; a timeout may just be an engine busy prefilling
+    if (err.definite || err.code === 'ECONNREFUSED' || b.fails >= config.pollFails) {
+      b.healthy = false;
+      // requests still waiting for a first token can't tell a long prefill from a dead engine
+      for (const flight of b.flights) flight.engineDown();
+    }
   }
   wake();
 }
@@ -172,19 +187,17 @@ async function pollLoop(b) {
   }
 }
 
-// requests waiting for a slot re-check whenever one frees up or a poll lands
-const waiters = new Set();
+// requests waiting for a slot, in arrival order; claim is the busy home a patient one holds out for
+const queue = new Set();
 
 function wake() {
-  for (const w of waiters) w();
+  for (const w of queue) w.wake();
 }
 
-function nextChange(ms) {
-  return new Promise((resolve) => {
-    const done = () => { clearTimeout(timer); waiters.delete(done); resolve(); };
-    const timer = setTimeout(done, Math.max(1, ms));
-    waiters.add(done);
-  });
+function claimed(b) {
+  let n = 0;
+  for (const w of queue) if (w.claim === b && !w.isGone()) n++;
+  return n;
 }
 
 // free slots we are allowed to use, minus the requests already in flight
@@ -226,8 +239,11 @@ function conversationKey(body) {
   const msgs = Array.isArray(body.messages) ? body.messages : Array.isArray(body.input) ? body.input : [];
   let system = textOf(body.system) || textOf(body.instructions);
   if (!system && ['system', 'developer'].includes(msgs[0]?.role)) system = textOf(msgs[0].content);
-  const first = textOf(msgs.find((m) => m?.role === 'user')?.content) || textOf(body.input) || textOf(body.prompt);
-  return createHash('sha256').update(`${body.model || 'default'}|${system}|${first.slice(0, 4000)}`).digest('hex').slice(0, 16);
+  const opener = msgs.find((m) => m?.role === 'user');
+  const text = textOf(opener?.content) || textOf(body.input) || textOf(body.prompt);
+  // an opener without text, say a lone image, is told apart by its raw content
+  const first = text ? text.slice(0, 4000) : JSON.stringify(opener?.content ?? null);
+  return createHash('sha256').update(`${body.model || 'default'}|${system}|${first}`).digest('hex').slice(0, 16);
 }
 
 function remember(key, conv) {
@@ -246,35 +262,50 @@ function patience(conv, home) {
 // streamed turns with a mostly uncached prompt show how fast an engine really prefills
 function learnPrefill(b, u, firstTokenMs) {
   const fresh = u.prompt - u.cached;
-  if (!(fresh >= 1000 && firstTokenMs >= 20)) return;
+  if (!(fresh >= 1000 && u.cached <= fresh && firstTokenMs >= 20)) return;
   const rate = Math.min(config.prefillTokS * 10, Math.max(config.prefillTokS / 10, fresh / (firstTokenMs / 1000)));
   b.prefill_tok_s = Math.round(b.prefill_tok_s ? 0.7 * b.prefill_tok_s + 0.3 * rate : rate);
 }
 
-// resolves to a backend with a slot already reserved, or none when nothing can take the request
-async function pick(conv, isGone) {
-  const t0 = Date.now();
+// the backend it returns already has a slot reserved for the caller
+async function pick(conv, isGone, exclude = null) {
+  const t0 = performance.now();
+  const me = { claim: null, isGone, wake() {} };
   let waited = false;
-  for (;;) {
-    if (isGone() || draining) return {};
-    const elapsed = Date.now() - t0;
-    const home = config.backends.find((b) => b.name === conv.backend);
-    if (home && capacity(home)) return { b: reserve(home), waited };
+  try {
+    for (;;) {
+      if (isGone() || draining) return {};
+      const elapsed = performance.now() - t0;
+      const home = config.backends.find((b) => b.name === conv.backend && b !== exclude);
+      if (home && capacity(home)) return { b: reserve(home), waited };
 
-    const healthy = config.backends.filter((b) => b.healthy);
-    if (!healthy.length && elapsed >= config.pollMs + 1000) return { waited };
+      const healthy = config.backends.filter((b) => b.healthy && b !== exclude);
+      // a retry has nowhere to go; otherwise give the next poll a chance before failing
+      if (!healthy.length && (exclude || performance.now() - lastHealthyAt >= Math.min(config.queueWaitMs, config.pollMs + 1000))) return { waited };
 
-    const hold = patience(conv, home);
-    if (elapsed >= hold) {
-      const open = healthy.filter(capacity);
-      if (open.length) return { b: reserve(best(open)), waited };
+      const hold = patience(conv, home);
+      me.claim = elapsed < hold ? home : null;
+      if (!me.claim) {
+        const open = healthy.filter((b) => capacity(b) && freeSlots(b) > claimed(b));
+        if (open.length) return { b: reserve(best(open)), waited };
+      }
+      // everything saturated for too long: let an engine queue it, home first
+      if (healthy.length && elapsed >= config.queueWaitMs) {
+        return { b: reserve(home?.healthy ? home : best(healthy)), waited, overflow: true };
+      }
+      waited = true;
+      queue.add(me);
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, Math.max(1, Math.min(1000, (me.claim ? hold : config.queueWaitMs) - elapsed)));
+        me.wake = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+      });
     }
-    // everything saturated for too long: let an engine queue it, home first
-    if (healthy.length && elapsed >= config.queueWaitMs) {
-      return { b: reserve(home?.healthy ? home : best(healthy)), waited, overflow: true };
-    }
-    waited = true;
-    await nextChange(Math.min(1000, (elapsed < hold ? hold : config.queueWaitMs) - elapsed));
+  } finally {
+    // a claim going away can open its slot to the others
+    if (queue.delete(me) && me.claim) wake();
   }
 }
 
@@ -316,7 +347,7 @@ function usageTap(sse) {
     } catch {
       return;
     }
-    if (!tap.firstTokenAt && generated(o)) tap.firstTokenAt = Date.now();
+    if (!tap.firstTokenAt && generated(o)) tap.firstTokenAt = performance.now();
     take(o);
   };
   const tap = {
@@ -346,92 +377,148 @@ function usageTap(sse) {
   return tap;
 }
 
+// the fixed hop-by-hop headers plus any a message lists in its own connection header
+function hopByHop(headers) {
+  const names = new Set(HOP);
+  for (const name of String(headers.connection || '').split(',')) if (name.trim()) names.add(name.trim().toLowerCase());
+  return names;
+}
+
 function passHeaders(headers, b) {
+  const drop = hopByHop(headers);
   const out = {};
-  for (const [k, v] of Object.entries(headers)) if (!HOP.has(k)) out[k] = v;
+  for (const [k, v] of Object.entries(headers)) if (!drop.has(k)) out[k] = v;
   out['x-strata-backend'] = b.name;
   return out;
 }
 
-// retryable means nothing reached the client yet; hold5xx buffers an engine 5xx instead of relaying it
-function forward(b, req, url, payload, res, hold5xx = false) {
+function upstreamHeaders(req, payload) {
+  const drop = hopByHop(req.headers);
+  const headers = {};
+  for (const [k, v] of Object.entries(req.headers)) if (!drop.has(k) && !NOT_FORWARDED.has(k)) headers[k] = v;
+  headers.accept ??= 'application/json';
+  if (payload) {
+    headers['content-type'] ??= 'application/json';
+    headers['content-length'] = payload.length;
+  }
+  return headers;
+}
+
+// aborts when the client hangs up; a pipelined request only notices through its socket
+function watchClient(req, res) {
+  const ac = new AbortController();
+  const hangup = () => {
+    if (!res.writableFinished) ac.abort();
+  };
+  if (res.destroyed || req.socket.destroyed) ac.abort();
+  res.on('close', hangup);
+  req.socket.on('close', hangup);
+  ac.signal.addEventListener('abort', wake);
+  return {
+    signal: ac.signal,
+    stop() {
+      res.off('close', hangup);
+      req.socket.off('close', hangup);
+    },
+  };
+}
+
+// retryable means the engine never started an answer; hold5xx buffers an engine 5xx instead of relaying it
+function forward(b, req, url, payload, res, { hold5xx = false, signal }) {
   return new Promise((resolve) => {
-    if (res.destroyed) return resolve({ ok: false, retryable: false, aborted: true, error: 'client went away', elapsed: 0 });
-    const t0 = Date.now();
+    if (signal.aborted) return resolve({ ok: false, retryable: false, aborted: true, error: 'client went away', elapsed: 0 });
+    const t0 = performance.now();
     let settled = false;
     let connected = false;
-    let gone = false;
+    let timedOut = false;
+    let responded = false;
+    let tap = null;
     let connectTimer;
 
+    // only an answer that hasn't reached the client can move; a started one waits for READ_TIMEOUT
+    const flight = {
+      engineDown() {
+        if (!res.headersSent) up.destroy(new Error('engine stopped answering polls'));
+      },
+    };
     const done = (result) => {
       if (settled) return;
       settled = true;
       clearTimeout(connectTimer);
-      res.off('close', onClientClose);
-      resolve({ elapsed: Date.now() - t0, ...result });
+      b.flights.delete(flight);
+      signal.removeEventListener('abort', onClientGone);
+      resolve({ elapsed: Math.round(performance.now() - t0), ...result });
     };
     const fail = (err) => {
       if (settled) return;
-      const error = String(err?.message || err);
+      const error = errText(err);
+      const gone = signal.aborted;
       if (!connected && !gone) {
         b.healthy = false;
         b.lastError = error;
       }
       // a half-sent answer has to look broken to the client, not complete
       if (res.headersSent && !res.writableEnded) res.destroy();
-      done({ ok: false, retryable: !res.headersSent && !gone, aborted: gone, error });
+      done({ ok: false, retryable: !res.headersSent && !gone, timedOut, aborted: gone, error });
     };
-    const onClientClose = () => {
-      if (res.writableFinished) return;
-      gone = true;
-      up.destroy(new Error('client went away'));
+    const onClientGone = () => up.destroy(new Error('client went away'));
+    // silence is fine while the engine reports work: long prefills and non-streamed answers say nothing for minutes
+    const onSilence = (socket) => {
+      if (connected && b.healthy && busy(b)) return socket.setTimeout(config.readTimeoutMs);
+      timedOut = true;
+      up.destroy(new Error('read timeout'));
     };
 
-    const headers = { accept: req.headers.accept || 'application/json' };
-    if (payload) {
-      headers['content-type'] = req.headers['content-type'] || 'application/json';
-      headers['content-length'] = payload.length;
-    }
-
-    const up = http.request({ host: b.host, port: b.port, path: url, method: req.method, headers, agent, timeout: config.readTimeoutMs }, (r) => {
+    const options = { host: b.host, port: b.port, path: url, method: req.method, headers: upstreamHeaders(req, payload), agent };
+    const up = http.request(options, (r) => {
+      responded = true;
       r.on('error', fail);
       if (hold5xx && r.statusCode >= 500) {
         const chunks = [];
-        r.on('data', (c) => chunks.push(c));
-        r.on('end', () => done({ ok: false, retryable: !gone, error: `upstream ${r.statusCode}`, status: r.statusCode, headers: r.headers, body: Buffer.concat(chunks) }));
+        let size = 0;
+        r.on('data', (c) => {
+          if ((size += c.length) > 1_000_000) up.destroy(new Error(`upstream ${r.statusCode} with an oversized error body`));
+          else chunks.push(c);
+        });
+        r.on('end', () => done({ ok: false, retryable: !signal.aborted, error: `upstream ${r.statusCode}`, status: r.statusCode, headers: r.headers, body: Buffer.concat(chunks) }));
         return;
       }
       try {
         res.writeHead(r.statusCode, passHeaders(r.headers, b));
       } catch (err) {
-        r.resume();
-        return fail(err);
+        fail(err);
+        return up.destroy();
       }
-      const tap = usageTap(/event-stream/.test(r.headers['content-type'] || ''));
+      tap = usageTap(/event-stream/.test(r.headers['content-type'] || ''));
       r.on('data', (c) => {
-        res.write(c);
         tap.write(c);
+        if (!res.write(c)) {
+          r.pause();
+          res.once('drain', () => r.resume());
+        }
       });
       r.on('end', () => {
         res.end();
         done({ ok: true, status: r.statusCode, usage: tap.end(), firstTokenMs: tap.firstTokenAt && tap.firstTokenAt - t0 });
       });
     });
-    up.on('socket', (s) => {
-      if (settled || !s.connecting) {
+    up.on('socket', (socket) => {
+      socket.setTimeout(config.readTimeoutMs);
+      socket.on('timeout', () => onSilence(socket));
+      if (settled || !socket.connecting) {
         connected = true;
         return;
       }
       connectTimer = setTimeout(() => up.destroy(new Error('connect timeout')), config.connectTimeoutMs);
-      s.once('connect', () => {
+      socket.once('connect', () => {
         connected = true;
         clearTimeout(connectTimer);
       });
     });
-    up.on('timeout', () => up.destroy(new Error('read timeout')));
     up.on('error', fail);
     up.on('close', () => { if (!up.res?.complete) fail(new Error('engine closed the connection')); });
-    res.on('close', onClientClose);
+    b.flights.add(flight);
+    signal.addEventListener('abort', onClientGone);
     up.end(payload || undefined);
   });
 }
@@ -453,7 +540,7 @@ function readBody(req, res, cb) {
   req.on('end', () => cb(Buffer.concat(chunks)));
 }
 
-async function handleChat(req, res, raw) {
+async function handleChat(req, res, raw, url) {
   let body;
   try {
     body = JSON.parse(raw.toString('utf8'));
@@ -471,85 +558,95 @@ async function handleChat(req, res, raw) {
   conv.turns++;
   remember(key, conv);
 
-  let gone = false;
-  res.on('close', () => {
-    if (res.writableFinished) return;
-    gone = true;
-    wake();
-  });
-
-  const picked = await pick(conv, () => gone || res.destroyed);
-  if (!picked.b) {
-    if (gone) return;
-    if (draining) return send(res, 503, { error: 'router is shutting down' });
-    return send(res, 503, {
-      error: 'no healthy backend',
-      backends: config.backends.map((x) => ({ name: x.name, healthy: x.healthy, error: x.lastError })),
-    });
-  }
-  stats.requests++;
-  if (picked.waited) stats.queued++;
-  if (picked.overflow) stats.overflow++;
-
-  const attempt = async (b, hold5xx) => {
-    let out;
-    try {
-      out = await forward(b, req, req.url, raw, res, hold5xx);
-    } finally {
-      release(b);
+  const client = watchClient(req, res);
+  const gone = () => client.signal.aborted;
+  try {
+    const picked = await pick(conv, gone);
+    if (!picked.b) {
+      if (gone()) return;
+      if (draining) return send(res, 503, { error: 'router is shutting down' });
+      return send(res, 503, {
+        error: 'no healthy backend',
+        backends: config.backends.map((x) => ({ name: x.name, healthy: x.healthy, error: x.lastError })),
+      });
     }
-    if (!out.ok && !out.aborted) {
-      stats.errors++;
-      log(`fail ${b.name} ${out.error} (${out.elapsed}ms)`);
-    }
-    return out;
-  };
+    stats.requests++;
+    if (picked.waited) stats.queued++;
+    if (picked.overflow) stats.overflow++;
 
-  let served = picked.b;
-  let out = await attempt(served, true);
-  if (!out.ok && out.retryable) {
-    const open = config.backends.filter((x) => x !== served && capacity(x));
-    if (open.length) {
-      stats.retried++;
-      served = reserve(best(open));
-      out = await attempt(served, false);
-    }
-  }
+    const attempt = async (b, hold5xx) => {
+      let out;
+      try {
+        out = await forward(b, req, url, raw, res, { hold5xx, signal: client.signal });
+      } finally {
+        release(b);
+      }
+      if (!out.ok && !out.aborted) {
+        stats.errors++;
+        log(`fail ${b.name} ${out.error} (${out.elapsed}ms)`);
+      }
+      return out;
+    };
 
-  // the engine took the prompt, so that's where its KV lives now
-  if (out.ok ? out.status < 400 : res.headersSent) {
-    if (conv.backend && conv.backend !== served.name) stats.migrated++;
-    conv.backend = served.name;
-  }
+    const spare = config.backends.length > 1;
+    let served = picked.b;
+    let overflow = picked.overflow;
+    let out = await attempt(served, spare);
+    // the engine never started an answer: queue again for a different one
+    if (!out.ok && out.retryable && spare) {
+      const again = await pick(conv, gone, served);
+      if (again.b) {
+        stats.retried++;
+        served = again.b;
+        overflow = again.overflow;
+        out = await attempt(served, false);
+      }
+    }
 
-  if (out.ok) {
-    const u = out.usage;
-    if (u) {
-      stats.prompt_tokens += u.prompt;
-      stats.completion_tokens += u.completion;
-      stats.cached_tokens += u.cached;
-      conv.prompt_tokens = u.prompt;
-      if (out.firstTokenMs) learnPrefill(served, u, out.firstTokenMs);
+    // the engine took the prompt, so that's where its KV lives now
+    if (out.ok ? out.status < 400 : res.headersSent) {
+      if (conv.backend && conv.backend !== served.name) stats.migrated++;
+      conv.backend = served.name;
     }
-    const status = out.status === 200 ? '' : ` status=${out.status}`;
-    log(`${served.name} key=${key} turns=${conv.turns}${status} prompt=${u?.prompt ?? '-'} cached=${u?.cached ?? '-'} out=${u?.completion ?? '-'} ${out.elapsed}ms`);
-  } else if (out.aborted) {
-    log(`gone ${served.name} key=${key} after ${out.elapsed}ms`);
-  } else if (!res.headersSent) {
-    if (out.status) {
-      res.writeHead(out.status, passHeaders(out.headers, served));
-      res.end(out.body);
-    } else {
-      send(res, 502, { error: out.error, backend: served.name });
+
+    if (out.ok) {
+      const u = out.usage;
+      if (u) {
+        stats.prompt_tokens += u.prompt;
+        stats.completion_tokens += u.completion;
+        stats.cached_tokens += u.cached;
+        // after an overflow the time to first token includes the engine's own queue
+        if (out.firstTokenMs && !overflow) learnPrefill(served, u, out.firstTokenMs);
+      }
+      // without usage, guess the prompt from the request size so patience still works
+      conv.prompt_tokens = u?.prompt || Math.round(raw.length / 4);
+      const status = out.status === 200 ? '' : ` status=${out.status}`;
+      log(`${served.name} key=${key} turns=${conv.turns}${status} prompt=${u?.prompt ?? '-'} cached=${u?.cached ?? '-'} out=${u?.completion ?? '-'} ${out.elapsed}ms`);
+    } else if (out.aborted) {
+      log(`gone ${served.name} key=${key} after ${out.elapsed}ms`);
+    } else if (!res.headersSent) {
+      if (out.status) {
+        res.writeHead(out.status, passHeaders(out.headers, served));
+        res.end(out.body);
+      } else {
+        send(res, out.timedOut ? 504 : 502, { error: out.error, backend: served.name });
+      }
     }
+  } finally {
+    client.stop();
   }
 }
 
 async function relay(req, res, url, raw) {
   const b = config.backends.find((x) => x.healthy);
   if (!b) return send(res, 503, { error: 'no healthy backend' });
-  const out = await forward(b, req, url, req.method === 'GET' ? null : raw, res);
-  if (!out.ok && !out.aborted && !res.headersSent) send(res, 502, { error: out.error, backend: b.name });
+  const client = watchClient(req, res);
+  try {
+    const out = await forward(b, req, url, req.method === 'GET' ? null : raw, res, { signal: client.signal });
+    if (!out.ok && !out.aborted && !res.headersSent) send(res, out.timedOut ? 504 : 502, { error: out.error, backend: b.name });
+  } finally {
+    client.stop();
+  }
 }
 
 function handleGet(res, path) {
@@ -576,6 +673,7 @@ function handleGet(res, path) {
         requests: b.cache?.requests ?? 0,
         lastError: b.lastError,
       })),
+      waiting: queue.size,
       conversations: [...convs].slice(-50).map(([key, c]) => ({ key, backend: c.backend, turns: c.turns, prompt_tokens: c.prompt_tokens })),
     });
   }
@@ -616,7 +714,10 @@ const server = http.createServer((req, res) => {
     res.setHeader('connection', 'close');
     return send(res, 503, { error: 'router is shutting down' });
   }
-  const path = (req.url || '/').split('?')[0];
+  const url = req.url || '/';
+  const q = url.indexOf('?');
+  // a trailing or doubled slash still reaches the routed paths
+  const path = (q < 0 ? url : url.slice(0, q)).replace(/\/{2,}/g, '/').replace(/(.)\/$/, '$1');
   if (req.method === 'GET' && LOCAL.has(path)) return handleGet(res, path);
 
   const routed = req.method === 'POST' && ROUTED.has(path);
@@ -626,18 +727,27 @@ const server = http.createServer((req, res) => {
   }
 
   readBody(req, res, (raw) => {
+    // counted until the client has the whole answer, so a drain never cuts one short
     active++;
-    const work = routed ? handleChat(req, res, raw) : relay(req, res, path === '/models' ? '/v1/models' : req.url, raw);
-    work
-      .catch((err) => {
-        console.error('strata-router: unexpected error', err);
-        if (!res.headersSent) send(res, 500, { error: 'internal error' });
-        else res.destroy();
-      })
-      .finally(() => {
-        active--;
-        if (draining && !active) exit();
-      });
+    let counted = true;
+    const settle = () => {
+      if (!counted) return;
+      counted = false;
+      req.socket.off('close', settle);
+      active--;
+      if (draining && !active) drained();
+    };
+    // each request in flight watches its socket twice; pipelining clients stack those up
+    req.socket.setMaxListeners(0);
+    res.once('close', settle);
+    req.socket.once('close', settle);
+    const target = q < 0 ? path : path + url.slice(q);
+    const work = routed ? handleChat(req, res, raw, target) : relay(req, res, path === '/models' ? '/v1/models' : target, raw);
+    work.catch((err) => {
+      console.error('strata-router: unexpected error', err);
+      if (!res.headersSent) send(res, 500, { error: 'internal error' });
+      else res.destroy();
+    });
   });
 });
 
@@ -660,11 +770,18 @@ server.listen(config.port, process.env.BIND || '0.0.0.0', () => {
 function shutdown() {
   if (draining) return exit();
   draining = true;
-  server.close();
+  saveState();
+  // stop listening but keep connections: http's own close() also destroys those whose answer is still flushing
+  net.Server.prototype.close.call(server);
   wake();
-  if (!active) return exit();
-  log(`draining ${active} request(s) for up to ${config.shutdownGraceMs}ms`);
+  if (active) log(`draining ${active} request(s) for up to ${config.shutdownGraceMs}ms`);
   setTimeout(exit, config.shutdownGraceMs);
+  if (!active) drained();
+}
+
+// a client still reading an answer when its keep-alive connection drops can report it as cut off (undici does)
+function drained() {
+  setTimeout(exit, Math.min(1000, config.shutdownGraceMs));
 }
 
 function exit() {

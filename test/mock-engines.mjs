@@ -12,7 +12,22 @@ const json = (res, status, obj) => {
 const event = (res, data) => res.write(`data: ${typeof data === 'string' ? data : JSON.stringify(data)}\n\n`);
 
 export function makeEngine(name, port, batch = 2, latencyMs = 300) {
-  const engine = { name, port, mode: 'ok', queued: 0, metricsStatus: 200, metricsHangup: false, prefillMs: 0, usage: { ...USAGE }, posts: 0, aborted: 0, completed: 0 };
+  const engine = {
+    name,
+    port,
+    mode: 'ok',
+    queued: 0,
+    metricsStatus: 200,
+    metricsHangup: false,
+    reportIdle: false,
+    prefillMs: 0,
+    bigBytes: 8 << 20,
+    usage: { ...USAGE },
+    log: [],
+    posts: 0,
+    aborted: 0,
+    completed: 0,
+  };
   const inflight = new Set();
 
   engine.server = http.createServer((req, res) => {
@@ -24,14 +39,12 @@ export function makeEngine(name, port, batch = 2, latencyMs = 300) {
     if (req.url === '/metrics') {
       if (engine.metricsHangup) return req.socket.destroy();
       if (engine.metricsStatus !== 200) return json(res, engine.metricsStatus, { error: 'model loading' });
+      const running = engine.reportIdle ? 0 : inflight.size;
       const slots = [];
-      for (let i = 0; i < batch; i++) {
-        const busy = [...inflight][i];
-        slots.push({ slot: i, state: busy ? 'decoding' : 'idle', held_tokens: busy ? 1000 : 0 });
-      }
+      for (let i = 0; i < batch; i++) slots.push({ slot: i, state: i < running ? 'decoding' : 'idle', held_tokens: i < running ? 1000 : 0 });
       json(res, 200, {
         engine: { model: 'fake', batch_slots: batch, vram_free_mib: 1000 },
-        live: { state: inflight.size ? 'busy' : 'idle', queued: engine.queued, running: inflight.size, slots, parallel: batch, tok_s_mean: 60 },
+        live: { state: running ? 'busy' : 'idle', queued: engine.queued, running, slots, parallel: batch, tok_s_mean: 60 },
         conversation_cache: { enabled: true, budget_mib: 32768, parked: 0, requests: 10, requests_reused: 5 },
       });
       return;
@@ -46,10 +59,12 @@ export function makeEngine(name, port, batch = 2, latencyMs = 300) {
       const raw = Buffer.concat(chunks);
       let body = {};
       try { body = JSON.parse(raw) || {}; } catch {}
+      const first = Array.isArray(body.messages) ? body.messages.find((m) => m?.role === 'user')?.content : undefined;
+      engine.log.push({ url: req.url, first, headers: req.headers });
       const id = Math.random().toString(36).slice(2);
       inflight.add(id);
       res.on('close', () => inflight.delete(id));
-      generate(engine, req, res, body, raw, latencyMs);
+      generate(engine, req, res, body, raw, Number.isFinite(body.latency_ms) ? body.latency_ms : latencyMs);
     });
   });
 
@@ -59,7 +74,9 @@ export function makeEngine(name, port, batch = 2, latencyMs = 300) {
 
 function generate(engine, req, res, body, raw, latencyMs) {
   const { mode } = engine;
+  if (mode === 'hang') return;
   if (mode === '500') return json(res, 500, { error: 'engine exploded' });
+  if (mode === '500big') return json(res, 500, { error: 'x'.repeat(2 << 20) });
 
   if (mode === 'drop' || mode === 'reset') {
     res.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -72,6 +89,12 @@ function generate(engine, req, res, body, raw, latencyMs) {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.flushHeaders();
     setTimeout(() => res.socket.destroy(), 50);
+    return;
+  }
+
+  if (mode === 'big') {
+    res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': engine.bigBytes });
+    res.end(Buffer.alloc(engine.bigBytes, 'x'));
     return;
   }
 
@@ -98,14 +121,15 @@ function generate(engine, req, res, body, raw, latencyMs) {
 
 function reply(engine, req, res, body, raw) {
   const text = `answer from ${engine.name}`;
-  const { prompt, cached, completion } = engine.usage;
+  const { prompt, cached, completion } = engine.usage || {};
+  const usage = engine.usage && { prompt_tokens: prompt, completion_tokens: completion, prompt_tokens_details: { cached_tokens: cached } };
 
   if (req.url.startsWith('/v1/messages')) {
     return json(res, 200, {
       type: 'message',
       role: 'assistant',
       content: [{ type: 'text', text }],
-      usage: { input_tokens: prompt - cached, cache_read_input_tokens: cached, cache_creation_input_tokens: 0, output_tokens: completion },
+      usage: engine.usage && { input_tokens: prompt - cached, cache_read_input_tokens: cached, cache_creation_input_tokens: 0, output_tokens: completion },
     });
   }
 
@@ -113,17 +137,16 @@ function reply(engine, req, res, body, raw) {
     return json(res, 200, {
       object: 'response',
       output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] }],
-      usage: { input_tokens: prompt, input_tokens_details: { cached_tokens: cached }, output_tokens: completion },
+      usage: engine.usage && { input_tokens: prompt, input_tokens_details: { cached_tokens: cached }, output_tokens: completion },
     });
   }
 
-  const usage = { prompt_tokens: prompt, completion_tokens: completion, prompt_tokens_details: { cached_tokens: cached } };
   if (body.stream) {
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     event(res, { object: 'chat.completion.chunk', choices: [{ index: 0, delta: { role: 'assistant', content: '' } }], usage: null });
     setTimeout(() => {
       for (const content of ['answer from ', engine.name]) event(res, { object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content } }], usage: null });
-      event(res, { object: 'chat.completion.chunk', choices: [], usage });
+      if (usage) event(res, { object: 'chat.completion.chunk', choices: [], usage });
       event(res, '[DONE]');
       res.end();
     }, engine.prefillMs);

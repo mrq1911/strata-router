@@ -2,7 +2,9 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import http from 'node:http';
+import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { makeEngine } from './mock-engines.mjs';
@@ -35,19 +37,23 @@ async function router(backends, env = {}) {
       POLL_MS: '100',
       ...env,
     },
-    stdio: 'inherit',
+    stdio: ['ignore', 'inherit', 'pipe'],
   });
   routers.push(child);
-  const url = `http://127.0.0.1:${port}`;
+  const r = { url: `http://127.0.0.1:${port}`, child, stderr: '' };
+  child.stderr.on('data', (c) => {
+    r.stderr += c;
+    process.stderr.write(c);
+  });
   for (let i = 0; i < 100 && child.exitCode === null; i++) {
     try {
-      await fetch(`${url}/health`);
+      await fetch(`${r.url}/health`);
       break;
     } catch {
       await sleep(50);
     }
   }
-  return { url, child };
+  return r;
 }
 
 const post = (r, path, body, init = {}) =>
@@ -60,8 +66,8 @@ const post = (r, path, body, init = {}) =>
 
 const get = async (r, path) => (await fetch(`${r.url}${path}`)).json();
 
-async function chat(r, messages) {
-  const res = await post(r, '/v1/chat/completions', { model: 'fake', messages, max_tokens: 10 });
+async function chat(r, messages, extra = {}) {
+  const res = await post(r, '/v1/chat/completions', { model: 'fake', messages, max_tokens: 10, ...extra });
   const d = await res.json().catch(() => ({}));
   return { status: res.status, backend: res.headers.get('x-strata-backend'), text: d.choices?.[0]?.message?.content, error: d.error, sha256: d.sha256 };
 }
@@ -187,6 +193,11 @@ await scenario('5xx', async () => {
   const st = (await get(r, '/stats')).stats;
   check('engine 5xx before any output is retried on the other engine', moved.status === 200 && moved.backend === 'B' && st.retried === 1, `${moved.status} ${moved.backend} retried=${st.retried}`);
 
+  A.mode = '500big';
+  const big = await chat(r, turns('oversized error', 0));
+  check('an oversized engine error body is dropped and the request still moves', big.status === 200 && big.backend === 'B', `${big.status} ${big.backend}`);
+  A.mode = '500';
+
   const solo = await router([A]);
   const passed = await chat(solo, turns('nowhere to go', 0));
   check('with nowhere to retry, the engine error is passed on', passed.status === 500 && passed.error === 'engine exploded', `${passed.status} ${JSON.stringify(passed.error)}`);
@@ -228,8 +239,11 @@ await scenario('keys', async () => {
   await send('/v1/responses', { input: [{ role: 'user', content: 'plums' }] });
   await send('/v1/responses', { input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'figs' }] }] });
   await send('/v1/messages', { system: [{ type: 'text', text: 'be terse' }], messages: [{ role: 'user', content: 'figs' }] });
+  const image = (data) => [{ type: 'image_url', image_url: { url: `data:image/png;base64,${data}` } }];
+  await send('/v1/chat/completions', { messages: [{ role: 'user', content: image('AAAA') }] });
+  await send('/v1/chat/completions', { messages: [{ role: 'user', content: image('BBBB') }] });
   const { cold } = (await get(r, '/stats')).stats;
-  check('responses and messages conversations get their own keys', cold === 5, `cold=${cold}`);
+  check('responses, messages and image-only conversations get their own keys', cold === 7, `cold=${cold}`);
 });
 
 await scenario('usage', async () => {
@@ -262,6 +276,35 @@ await scenario('passthrough', async () => {
   const q = await post(open, '/v1/chat/completions?api-version=1', { model: 'fake', messages: [{ role: 'user', content: 'q' }] });
   const after = (await get(open, '/stats')).stats.requests;
   check('chat path with a query string is still routed', q.status === 200 && after === before + 1, `${q.status}, routed +${after - before}`);
+
+  for (const odd of ['/v1/chat/completions/', '//v1/chat/completions']) {
+    await (await post(open, odd, { model: 'fake', messages: [{ role: 'user', content: 'odd path' }] })).text();
+  }
+  const oddRouted = (await get(open, '/stats')).stats.requests - after;
+  const oddUrls = A.log.slice(-2).map((x) => x.url);
+  check('trailing and doubled slashes still route', oddRouted === 2 && oddUrls.every((u) => u === '/v1/chat/completions'), `routed +${oddRouted}, engine saw ${oddUrls.join(' ')}`);
+});
+
+await scenario('headers', async () => {
+  const A = await engine('A', 20);
+  const r = await router([A]);
+  const headers = { 'content-type': 'application/json', authorization: 'Bearer local', 'x-api-key': 'k', 'anthropic-version': '2023-06-01', 'accept-encoding': 'gzip' };
+  await (await post(r, '/v1/messages', { model: 'fake', max_tokens: 10, messages: [{ role: 'user', content: 'keys' }] }, { headers })).text();
+  const seen = A.log.at(-1).headers;
+  check('end-to-end client headers reach the engine', seen.authorization === 'Bearer local' && seen['x-api-key'] === 'k' && seen['anthropic-version'] === '2023-06-01' && !seen['accept-encoding'], JSON.stringify({ authorization: seen.authorization, 'x-api-key': seen['x-api-key'], 'accept-encoding': seen['accept-encoding'] }));
+
+  const status = await new Promise((resolve, reject) => {
+    const req = http.request(`${r.url}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', connection: 'keep-alive, x-hop', 'x-hop': 'local only' },
+    }, (res) => {
+      res.resume();
+      res.on('end', () => resolve(res.statusCode));
+    });
+    req.on('error', reject);
+    req.end(JSON.stringify({ model: 'fake', messages: [{ role: 'user', content: 'hop' }] }));
+  });
+  check('headers named in connection stay hop-by-hop', status === 200 && !A.log.at(-1).headers['x-hop'], `status ${status}, x-hop=${A.log.at(-1).headers['x-hop']}`);
 });
 
 await scenario('health', async () => {
@@ -273,6 +316,11 @@ await scenario('health', async () => {
   const res = await chat(r, turns('anyone there', 0));
   const ms = Date.now() - t0;
   check('nothing healthy: 503 without sitting out MAX_QUEUE_WAIT', res.status === 503 && ms < 2000, `${res.status} in ${ms}ms`);
+  await sleep(1200);
+  const t1 = Date.now();
+  const later = await chat(r, turns('still nobody', 0));
+  const ms1 = Date.now() - t1;
+  check('engines down for a while: 503 at once', later.status === 503 && ms1 < 300, `${later.status} in ${ms1}ms`);
 });
 
 await scenario('poll hysteresis', async () => {
@@ -341,7 +389,7 @@ await scenario('drain', async () => {
   const [code] = await exit;
   const ms = Date.now() - t0;
   check('SIGTERM lets the answer in flight finish', A.completed === 1 && text.includes('t19'), `completed=${A.completed}`);
-  check('... turns new work away and exits once idle', late !== 200 && code === 0 && ms < 3000, `late=${late}, exit ${code} after ${ms}ms`);
+  check('... turns new work away and exits once idle', late !== 200 && code === 0 && ms < 5000, `late=${late}, exit ${code} after ${ms}ms`);
 });
 
 await scenario('settings', async () => {
@@ -416,7 +464,187 @@ await scenario('state file', async () => {
   }
 });
 
-for (const child of routers) child.kill();
+await scenario('fifo', async () => {
+  const E = await engine('E', 10);
+  const r = await router([E], { MAX_INFLIGHT: '1', POLL_MS: '60000', MAX_QUEUE_WAIT: '20000' });
+  const holder = chat(r, turns('L', 0), { latency_ms: 2300 });
+  await sleep(100);
+  const a = chat(r, turns('A', 0));
+  await sleep(500);
+  const b = chat(r, turns('B', 0));
+  await Promise.all([holder, a, b]);
+  const order = E.log.map((x) => x.first).join(',');
+  check('requests waiting for a slot are served in arrival order', order === 'L,A,B', order);
+});
+
+await scenario('home claim', async () => {
+  const A = await engine('A', 20);
+  const B = await engine('B', 20);
+  const r = await router([A, B], { MAX_INFLIGHT: '1', POLL_MS: '60000', PREFILL_TOK_S: '2000', MAX_QUEUE_WAIT: '10000' });
+  await chat(r, turns('patient', 0));
+  const holdA = chat(r, turns('hold A', 0), { latency_ms: 400 });
+  await sleep(30);
+  const holdB = chat(r, turns('hold B', 0), { latency_ms: 750 });
+  await sleep(30);
+  const newcomer = chat(r, turns('newcomer', 0), { latency_ms: 450 });
+  await sleep(30);
+  const patient = chat(r, turns('patient', 1));
+  const [n, p] = await Promise.all([newcomer, patient, holdA, holdB]);
+  const servedA = A.log.map((x) => x.first);
+  const patientFirst = n.backend === 'B' || servedA.lastIndexOf('patient') < servedA.indexOf('newcomer');
+  check('a conversation waiting for its home keeps that slot from newcomers', p.backend === 'A' && patientFirst, `patient -> ${p.backend}, newcomer -> ${n.backend}, A served ${servedA.join(',')}`);
+});
+
+await scenario('dead home', async () => {
+  const A = await engine('A', 20);
+  const B = await engine('B', 20);
+  const r = await router([A, B], { MAX_INFLIGHT: '1', POLL_MS: '60000' });
+  const home = await chat(r, turns('home dies', 0));
+  const holdA = chat(r, turns('hold A', 0), { latency_ms: 200 });
+  await sleep(30);
+  const holdB = chat(r, turns('hold B', 0), { latency_ms: 800 });
+  await holdA;
+  A.server.closeAllConnections();
+  A.server.close();
+  const t0 = Date.now();
+  const moved = await chat(r, turns('home dies', 1));
+  const ms = Date.now() - t0;
+  await holdB;
+  check('home refusing connections: the request queues for another engine instead of failing', home.backend === 'A' && moved.status === 200 && moved.backend === 'B', `${moved.status} from ${moved.backend} after ${ms}ms`);
+});
+
+await scenario('read timeout', async () => {
+  const A = await engine('A', 20);
+  const B = await engine('B', 20);
+  const r = await router([A, B], { READ_TIMEOUT: '300' });
+  const quiet = await chat(r, turns('long silent prefill', 0), { latency_ms: 1000 });
+  check('silence past READ_TIMEOUT is fine while the engine reports work', quiet.status === 200 && quiet.backend === 'A' && B.posts === 0, `${quiet.status} from ${quiet.backend}, B got ${B.posts}`);
+
+  A.mode = 'hang';
+  A.reportIdle = true;
+  await sleep(250);
+  const lost = await chat(r, turns('lost on the engine', 0));
+  A.mode = 'ok';
+  A.reportIdle = false;
+  check('silence from an engine with nothing running: given up and moved', lost.status === 200 && lost.backend === 'B', `${lost.status} from ${lost.backend}`);
+
+  const C = await engine('C', 20);
+  const D = await engine('D', 20);
+  const r2 = await router([C, D], { POLL_FAILS: '2', READ_TIMEOUT: '30000' });
+  C.mode = 'hang';
+  const t0 = Date.now();
+  const pending = chat(r2, turns('engine vanishes', 0));
+  await sleep(150);
+  C.metricsHangup = true;
+  const vanished = await pending;
+  const ms = Date.now() - t0;
+  check('engine stops answering polls mid-prefill: moved without waiting out READ_TIMEOUT', vanished.status === 200 && vanished.backend === 'D' && ms < 3000, `${vanished.status} from ${vanished.backend} after ${ms}ms`);
+
+  const E = await engine('E', 20);
+  const F = await engine('F', 20);
+  const r3 = await router([E, F], { POLL_FAILS: '2' });
+  E.prefillMs = 1500;
+  const started = stream(r3, 'already streaming');
+  await sleep(150);
+  E.metricsHangup = true;
+  const outcome = await started;
+  E.metricsHangup = false;
+  check('a stream that already started is not cut when polls give its engine up', outcome === 'clean', outcome);
+});
+
+await scenario('drain slow client', async () => {
+  const A = await engine('A', 20);
+  const r = await router([A], { SHUTDOWN_GRACE: '10000' });
+  A.mode = 'big';
+  const res = await post(r, '/v1/chat/completions', { model: 'fake', messages: [{ role: 'user', content: 'big answer' }] });
+  const reader = res.body.getReader();
+  const exit = once(r.child, 'exit');
+  let got = 0;
+  for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) {
+    if (got < 1 << 20 && got + chunk.value.length >= 1 << 20) r.child.kill('SIGTERM');
+    got += chunk.value.length;
+    await sleep(1);
+  }
+  const [code] = await exit;
+  check('a drain waits until a slow client has the whole answer', got === A.bigBytes && code === 0, `${got} of ${A.bigBytes} bytes, exit ${code}`);
+});
+
+await scenario('state on kill', async () => {
+  const A = await engine('A', 20);
+  const dir = mkdtempSync(join(tmpdir(), 'strata-router-'));
+  try {
+    const STATE_FILE = join(dir, 'homes.json');
+    const r = await router([A], { STATE_FILE, SHUTDOWN_GRACE: '10000' });
+    await chat(r, turns('remember me', 0));
+    A.mode = 'slow';
+    const busyStream = stream(r, 'keeps the drain going');
+    await sleep(100);
+    const exit = once(r.child, 'exit');
+    r.child.kill('SIGTERM');
+    await sleep(100);
+    r.child.kill('SIGKILL');
+    await exit;
+    await busyStream;
+    const saved = existsSync(STATE_FILE) ? JSON.parse(readFileSync(STATE_FILE, 'utf8')).length : 0;
+    check('homes are saved when the drain starts, so a kill mid-drain keeps them', saved >= 1, `${saved} saved`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await scenario('pipelined hang-up', async () => {
+  const A = await engine('A', 20);
+  const r = await router([A], { MAX_INFLIGHT: '1', POLL_MS: '60000' });
+  const holder = chat(r, turns('hold the slot', 0), { latency_ms: 600 });
+  await sleep(50);
+  const request = (content) => {
+    const body = JSON.stringify({ model: 'fake', messages: [{ role: 'user', content }] });
+    return `POST /v1/chat/completions HTTP/1.1\r\nhost: router\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(body)}\r\n\r\n${body}`;
+  };
+  const socket = net.connect(Number(new URL(r.url).port), '127.0.0.1');
+  await once(socket, 'connect');
+  socket.write(Array.from({ length: 6 }, (_, i) => request(`pipelined ${i}`)).join(''));
+  await sleep(100);
+  socket.destroy();
+  await holder;
+  await sleep(300);
+  const inflight = (await get(r, '/health')).backends[0].inflight;
+  const reached = A.log.filter((x) => String(x.first).startsWith('pipelined')).length;
+  check('pipelined requests from a client that hung up never reach the engine', reached === 0 && inflight === 0, `reached=${reached} inflight=${inflight}`);
+  check('six pipelined requests without a listener warning', !r.stderr.includes('MaxListenersExceededWarning'), r.stderr.trim().split('\n')[0] || 'no warnings');
+});
+
+await scenario('retry with nowhere to go', async () => {
+  const A = await engine('A', 20);
+  const B = await engine('B', 20);
+  const r = await router([A, B]);
+  B.server.closeAllConnections();
+  B.server.close();
+  await sleep(300);
+  A.mode = '500';
+  const t0 = Date.now();
+  const res = await post(r, '/v1/chat/completions', { model: 'fake', messages: [{ role: 'user', content: 'nowhere left' }] }, { signal: AbortSignal.timeout(5000) });
+  const body = await res.json();
+  const ms = Date.now() - t0;
+  check('retry with the only other engine down: the engine error comes back instead of a hang', res.status === 500 && body.error === 'engine exploded' && ms < 2000, `${res.status} in ${ms}ms`);
+});
+
+await scenario('no usage', async () => {
+  const A = await engine('A', 20);
+  const B = await engine('B', 20);
+  A.usage = null;
+  B.usage = null;
+  const r = await router([A, B], { PREFILL_TOK_S: '1000', MAX_QUEUE_WAIT: '10000' });
+  const opener = 'x'.repeat(4000);
+  const first = await chat(r, turns(opener, 0));
+  A.queued = 1;
+  await sleep(300);
+  setTimeout(() => (A.queued = 0), 300);
+  const next = await chat(r, turns(opener, 1));
+  check('no usage from the engine: patience comes from the request size', first.backend === 'A' && next.backend === 'A', `${first.backend} -> ${next.backend}`);
+});
+
+for (const child of routers) child.kill('SIGKILL');
 for (const e of engines) {
   e.server.closeAllConnections();
   e.server.close();
