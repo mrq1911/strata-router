@@ -176,12 +176,13 @@ await scenario('no retry once started', async () => {
   const B = await engine('B', 20);
   const r = await router([A, B]);
   for (const mode of ['drop-headers', 'reset']) {
-    A.mode = mode;
-    const before = B.posts;
+    A.mode = B.mode = mode;
+    const before = A.posts + B.posts;
     const outcome = await stream(r, `${mode} test`);
     await sleep(100);
-    check(`${mode}: client cut off, not retried, router up`, outcome === 'cut' && B.posts === before && r.child.exitCode === null, `${outcome}, B got ${B.posts - before}`);
+    check(`${mode}: client cut off, not retried, router up`, outcome === 'cut' && A.posts + B.posts === before + 1 && r.child.exitCode === null, `${outcome}, engines got ${A.posts + B.posts - before}`);
   }
+  A.mode = B.mode = 'ok';
 });
 
 await scenario('5xx', async () => {
@@ -763,6 +764,133 @@ await scenario('claim hold', async () => {
   await Promise.all(pending);
   const order = A.log.slice(4).map((x) => x.first);
   check('a newcomer waits out claims for at most CLAIM_HOLD_MS, then takes its turn', order.indexOf('N') < order.indexOf('P3'), order.join(','));
+});
+
+await scenario('engine restart', async () => {
+  const A = await engine('A', 20);
+  const B = await engine('B', 20);
+  const r = await router([A, B], { PREFILL_TOK_S: '1000', MAX_QUEUE_WAIT: '10000' });
+  const first = await chat(r, turns('warm', 0));
+  await chat(r, turns('warm', 1));
+  await sleep(300);
+  const calm = (await get(r, '/stats')).stats.restarts;
+  const [home, other] = first.backend === 'A' ? [A, B] : [B, A];
+  home.queued = 1;
+  home.restart();
+  await sleep(300);
+  const t0 = Date.now();
+  const moved = await chat(r, turns('warm', 2));
+  const ms = Date.now() - t0;
+  home.queued = 0;
+  const st = await get(r, '/stats');
+  const ev = (await get(r, '/stats/events')).events.at(-1);
+  check('a restarted home lost the cache: no waiting for it, the turn goes where there is room', calm === 0 && moved.backend === other.name && ms < 500 && ev.kind === 'cold' && st.stats.restarts === 1 && st.backends.find((b) => b.name === home.name).restarts === 1, `restarts before ${calm}, ${moved.backend} after ${ms}ms as ${ev.kind}, restarts ${st.stats.restarts}`);
+
+  await sleep(300);
+  other.queued = 1;
+  other.restart({ sameServer: true });
+  await sleep(300);
+  const t1 = Date.now();
+  const back = await chat(r, turns('warm', 3));
+  const ms1 = Date.now() - t1;
+  other.queued = 0;
+  const restarts = (await get(r, '/stats')).stats.restarts;
+  check('an engine restarted inside the same server counts too (its cache counters start over)', back.backend === home.name && ms1 < 500 && restarts === 2, `${back.backend} after ${ms1}ms, restarts ${restarts}`);
+});
+
+await scenario('short first', async () => {
+  const long = (name) => turns(`${name} ${'x'.repeat(9000)}`, 0);
+  const order = (e) => e.log.map((x) => String(x.first).split(' ')[0]).join(',');
+  const run = async (env, holdMs, queue) => {
+    const E = await engine('E', 10);
+    const r = await router([E], { MAX_INFLIGHT: '1', POLL_MS: '60000', MAX_QUEUE_WAIT: '20000', ...env });
+    const pending = [chat(r, turns('H', 0), { latency_ms: holdMs })];
+    for (const [at, messages] of queue) {
+      await sleep(at);
+      pending.push(chat(r, messages));
+    }
+    await Promise.all(pending);
+    return order(E);
+  };
+  const [jump, fifo, bounded] = await Promise.all([
+    run({}, 1000, [[100, long('L')], [100, turns('S', 0)]]),
+    run({ SHORT_PROMPT_TOKENS: '0' }, 1000, [[100, long('L')], [100, turns('S', 0)]]),
+    run({}, 5600, [[100, long('L1')], [1400, long('L2')], [500, turns('S', 0)]]),
+  ]);
+  check('a short request takes a freed slot before a long one queued ahead of it', jump === 'H,S,L', jump);
+  check('SHORT_PROMPT_TOKENS=0: plain arrival order', fifo === 'H,L,S', fifo);
+  check('a long request that already waited SHORT_PASS_MS is not passed any more', bounded === 'H,L1,S,L2', bounded);
+});
+
+await scenario('hang-up after [DONE]', async () => {
+  const A = await engine('A', 20);
+  A.tailMs = 300;
+  const r = await router([A]);
+  const res = await post(r, '/v1/chat/completions', { model: 'fake', stream: true, messages: [{ role: 'user', content: 'sdk style' }] });
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let text = '';
+  while (!text.includes('[DONE]')) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    text += dec.decode(value, { stream: true });
+  }
+  await reader.cancel();
+  await sleep(500);
+  const [ev] = (await get(r, '/stats/events')).events;
+  const { stats } = await get(r, '/stats');
+  check('a client hanging up right after [DONE] got a whole answer, not a cancelled one', ev?.kind === 'cold' && ev.status === 200 && ev.prompt_tokens === 1000 && ev.ttft_ms != null && stats.prompt_tokens === 1000, JSON.stringify({ kind: ev?.kind, error: ev?.error, prompt: ev?.prompt_tokens, ttft: ev?.ttft_ms }));
+});
+
+await scenario('direct use', async () => {
+  const A = await engine('A', 20);
+  const B = await engine('B', 20);
+  const r = await router([A, B], { PREFILL_TOK_S: '1000', MAX_QUEUE_WAIT: '10000' });
+  const first = await chat(r, turns('lives on A', 0));
+  const [home, other] = first.backend === 'A' ? [A, B] : [B, A];
+  const direct = (content) => post({ url: `http://127.0.0.1:${home.port}` }, '/v1/chat/completions', { model: 'fake', messages: [{ role: 'user', content }], latency_ms: 3000 }).then((x) => x.text());
+  const bypass = [direct('straight to the engine 1'), direct('straight to the engine 2')];
+  await sleep(400);
+  const seen = (await get(r, '/stats')).backends.find((b) => b.name === home.name).direct;
+  const fresh = await chat(r, turns('new while it is busy', 0));
+  const t0 = Date.now();
+  const sticky = await chat(r, turns('lives on A', 1));
+  const ms = Date.now() - t0;
+  await Promise.all(bypass);
+  await sleep(400);
+  const after = (await get(r, '/stats')).backends.find((b) => b.name === home.name).direct;
+  check('requests sent to an engine directly take its slots: newcomers go elsewhere', seen === 2 && fresh.backend === other.name && after === 0, `direct ${seen} then ${after}, new conversation -> ${fresh.backend}`);
+  check('a conversation whose home is used directly waits out its patience and spills instead of queueing inside it', sticky.backend === other.name && ms >= 900, `${sticky.backend} after ${ms}ms`);
+});
+
+await scenario('balance', async () => {
+  const A = await engine('A', 20);
+  const B = await engine('B', 20);
+  const r = await router([A, B]);
+  const idle = await chat(r, turns('both idle', 0));
+  const direct = (content) => post({ url: `http://127.0.0.1:${A.port}` }, '/v1/chat/completions', { model: 'fake', messages: [{ role: 'user', content }], latency_ms: 1500 }).then((x) => x.text());
+  await Promise.all([direct('keep A busy 1'), direct('keep A busy 2')]);
+  await sleep(300);
+  const busy = Object.fromEntries((await get(r, '/stats')).backends.map((b) => [b.name, b.busy]));
+  const next = await chat(r, turns('both idle again', 0));
+  check('with both engines idle, a new conversation goes to the one busy least lately', idle.backend === 'A' && busy.A > busy.B && next.backend === 'B', `first -> ${idle.backend}, busy ${JSON.stringify(busy)}, next -> ${next.backend}`);
+});
+
+await scenario('slow first token', async () => {
+  const A = await engine('A', 20);
+  const r = await router([A], { SLOW_FIRST_TOKEN: '200', PREFILL_TOK_S: '20000' });
+  await stream(r, 'quick');
+  A.prefillMs = 400;
+  await stream(r, 'stalled');
+  const [quick, stalled] = (await get(r, '/stats/events')).events;
+  const st = await get(r, '/stats');
+  check('a first token far slower than the uncached prompt needs is flagged', !quick.slow && stalled.slow && stalled.engine_ttft_ms >= 400 && stalled.expected_ttft_ms === 20 && st.stats.slow === 1 && st.backends[0].slow === 1, JSON.stringify({ quick: [quick.slow, quick.engine_ttft_ms], stalled: [stalled.slow, stalled.engine_ttft_ms, stalled.expected_ttft_ms] }));
+  const pending = chat(r, turns('busy now', 0), { latency_ms: 800 });
+  await sleep(400);
+  const [busy, inflight] = [(await get(r, '/stats')).backends[0], (await get(r, '/stats/events')).live];
+  await pending;
+  check('/stats shows what the engine is doing, for which conversation, and its hardware and recent speed', busy.activity.length === 1 && busy.activity[0].key === inflight[0]?.key && busy.activity[0].state === 'decoding' && busy.hardware.gpu_util === 50 && busy.history.gpu_util.length === 2 && busy.recent.decode_tok_s === 100 && busy.recent.prefill_tok_s === 2000 && busy.recent.draft_accept === 0.6, JSON.stringify({ activity: busy.activity, recent: busy.recent }));
+  check('/stats shows engine version and cache counters, and the router settings the dashboard explains', st.settings.max_queue_wait_ms === 30000 && st.backends[0].version === '0.0-mock' && st.backends[0].parks >= 1 && st.backends[0].prompt_tokens >= 1000 && st.backends[0].started > 0, JSON.stringify(st.backends[0]));
 });
 
 for (const child of routers) child.kill('SIGKILL');

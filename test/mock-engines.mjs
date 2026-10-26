@@ -31,14 +31,22 @@ export function makeEngine(name, port, batch = 2, latencyMs = 300) {
     unloaded: false,
     apiKey: '',
     prefillMs: 0,
+    tailMs: 0,
     bigBytes: 8 << 20,
     usage: { ...USAGE },
     log: [],
     posts: 0,
     aborted: 0,
     completed: 0,
+    since: Date.now() / 1000,
+    parks: 0,
+    // a new server start, or with sameServer the engine alone, which only zeroes the cache counters
+    restart({ sameServer = false } = {}) {
+      if (!sameServer) engine.since += 1;
+      engine.parks = 0;
+    },
   };
-  const inflight = new Set();
+  const inflight = new Map();
 
   engine.server = http.createServer((req, res) => {
     if (req.url === '/v1/models' || req.url === '/models') {
@@ -54,13 +62,25 @@ export function makeEngine(name, port, batch = 2, latencyMs = 300) {
       const live = { state: engine.unloaded ? 'unloaded' : running ? 'generating' : 'idle', queued: engine.queued, tok_s_mean: 60 };
       if (!engine.noBatch) {
         const slots = [];
-        for (let i = 0; i < batch; i++) slots.push({ slot: i, state: i < running ? 'decoding' : 'idle', held_tokens: i < running ? 1000 : 0 });
+        const since = [...inflight.values()];
+        for (let i = 0; i < batch; i++) {
+          const busy = i < running ? { prompt_tokens: 1000, generated: 5, tok_s: 60, elapsed_s: (Date.now() - since[i]) / 1000 } : {};
+          slots.push({ slot: i, state: i < running ? 'decoding' : 'idle', held_tokens: i < running ? 1000 : 0, ...busy });
+        }
         Object.assign(live, { running, slots, parallel: batch });
       }
+      const p = engine.parks;
       json(res, 200, {
-        engine: { model: 'fake', ...(engine.noBatch ? {} : { batch_slots: batch }), vram_free_mib: 1000 },
+        engine: { model: 'fake', version: '0.0-mock', ...(engine.noBatch ? {} : { batch_slots: batch }), vram_free_mib: 1000 },
         live,
-        conversation_cache: { enabled: true, budget_mib: 32768, parked: 0, requests: 10, requests_reused: 5 },
+        conversation_cache: {
+          enabled: true, budget_mib: 32768, slots: 8, parked: Math.min(8, p), parks: p, restores: 0, evictions: Math.max(0, p - 8),
+          requests: p, requests_reused: Math.floor(p / 2), reused_tokens: 600 * p, prompt_tokens: 1000 * p,
+        },
+        totals: { since: engine.since, requests: engine.posts },
+        hardware: { gpu_util: 50, gpu_mem_used: 20e9, gpu_mem_total: 24e9, cpu: 10, ram_used: 50e9, ram_total: 64e9 },
+        history: { gpu_util: [10, 50], tok_s: [0, 60] },
+        requests: p ? [{ output_tokens: 50, decode_tok_s: 100, prompt_read: 2000, prompt_ms: 1000, hit_rate: 0.9, pcie_share: 0.01, drafts_offered: 10, drafts_accepted: 6 }] : [],
       });
       return;
     }
@@ -78,8 +98,11 @@ export function makeEngine(name, port, batch = 2, latencyMs = 300) {
       const first = Array.isArray(body.messages) ? body.messages.find((m) => m?.role === 'user')?.content : undefined;
       engine.log.push({ url: req.url, first, headers: req.headers });
       const id = Math.random().toString(36).slice(2);
-      inflight.add(id);
-      res.on('close', () => inflight.delete(id));
+      inflight.set(id, Date.now());
+      res.on('close', () => {
+        inflight.delete(id);
+        engine.parks++;
+      });
       generate(engine, req, res, body, raw, Number.isFinite(body.latency_ms) ? body.latency_ms : latencyMs);
     });
   });
@@ -164,7 +187,7 @@ function reply(engine, req, res, body, raw) {
       for (const content of ['answer from ', engine.name]) event(res, { object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content } }], usage: null });
       if (usage) event(res, { object: 'chat.completion.chunk', choices: [], usage });
       event(res, '[DONE]');
-      res.end();
+      setTimeout(() => res.end(), engine.tailMs);
     }, engine.prefillMs);
     return;
   }

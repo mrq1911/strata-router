@@ -38,6 +38,8 @@ STRATA_BACKENDS="a=10.0.0.1:8080,b=10.0.0.2:8080" node router.mjs
 | `MAX_INFLIGHT` | `2` | per-engine cap; the router uses the smaller of this and the engine's reported batch slots (one when it has none) |
 | `MAX_QUEUE_WAIT` | `30000` | how long to wait for a free slot before handing the request to an engine's own queue |
 | `PREFILL_TOK_S` | `1400` | cold prefill speed until an engine's own is measured; decides how long a conversation waits for its busy home |
+| `SHORT_PROMPT_TOKENS` | `2048` | requests under this many prompt tokens (estimated from the request size) take a freed slot first; `0` keeps plain arrival order |
+| `SLOW_FIRST_TOKEN` | `10000` | flag a first token later than this many ms that also took 3x what its uncached prompt needs |
 | `CONNECT_TIMEOUT` | `10000` | TCP connect timeout to an engine; a failed connect marks it unhealthy until the next good poll |
 | `READ_TIMEOUT` | `300000` | how long an engine may stay silent before the router checks on it (see routing rules) |
 | `MAX_CONVERSATIONS` | `500` | size of the conversation map (LRU) |
@@ -58,7 +60,7 @@ a bad value stops the router at startup with a message naming it, rather than ro
 | `POST /v1/messages` | same routing (Anthropic-style payloads) |
 | `POST /v1/responses` | same routing (OpenAI Responses-style) |
 | `GET /health` | backend health, in-flight, queued |
-| `GET /stats` | counters, per-engine state, conversation homes |
+| `GET /stats` | counters, per-engine state, conversation homes, and the settings that shape routing |
 | `GET /dashboard` | live dashboard of engines, conversation homes and routing decisions (see [dashboard](#dashboard)) |
 | `GET /stats/events?since=<id>` | routing decisions after event `id` (the last 200 are kept), and the requests still waiting or running |
 | `GET /stats/conversations` | every tracked conversation, not just the last 50 |
@@ -81,10 +83,24 @@ a bad value stops the router at startup with a message naming it, rather than ro
   side requests can't starve behind it). Prefill speed is measured per engine from
   streamed turns with at least 1,000 uncached prompt tokens, starting from `PREFILL_TOK_S`; without usage in the
   answers, the prompt size is estimated from the request. New conversations don't wait.
-- **spill** to the least-loaded engine with a free slot after that, or right away when the home is down; the home
-  moves with the conversation.
-- **queue** up to `MAX_QUEUE_WAIT` when every engine is full, in arrival order, then hand the request to the home
-  engine's own queue.
+- **spill** after that, or right away when the home is down, to another engine picked like a new conversation's;
+  the home moves with the conversation.
+- **new conversations** (and spills) go to an engine with its model loaded and the most free slots, so concurrent
+  work spreads over the boxes; between equals, to the one busy least lately, so both boxes work about as long
+  (a slower one gets less); then to the faster prompt reader; then in `STRATA_BACKENDS` order. "Busy lately" is
+  the share of its slots in use at each poll, direct requests included, weighted toward the last 10 minutes.
+- **queue** up to `MAX_QUEUE_WAIT` when every engine is full, then hand the request to the home engine's own queue.
+  Waiting requests get freed slots in arrival order, except that short ones (under `SHORT_PROMPT_TOKENS`, like a
+  side request summarizing a turn) go first, ahead of longer ones that have waited less than 5 s: a short request
+  usually gives its slot back quickly, where waiting behind a long one costs it a whole turn.
+- **direct use** counts: requests a client sends to an engine directly, not through the router, take its slots too.
+  Each poll compares the requests the engine says it runs with the ones the router sent (one the router finished
+  while the poll was out still counts as its own), and requests seen twice in a row beyond those count as taken
+  slots, so routed requests wait or go elsewhere instead of queueing inside a busy engine. The dashboard marks them
+  `direct`. Their conversations still share the engine's cache, which the router can't see beyond its evictions.
+- **restart**: when an engine restarts (a new start time in its `/metrics`, or its conversation cache counters
+  starting over, which is how Strata restarting a stuck engine shows), its cache is empty, so its conversations
+  lose their home there and go wherever there is room, without waiting for it.
 - **fail fast** with 503 once no engine has been healthy for a poll interval, instead of queueing.
 - **retry** on another engine, queueing for it like any request, when the engine never started an answer: it
   refused or timed out the connection, reset it before answering, or answered 5xx. Once a response has started,
@@ -105,17 +121,30 @@ a bad value stops the router at startup with a message naming it, rather than ro
 - `held_tokens` — tokens resident in batch slots (`live.slots[].held_tokens`)
 - `parked` — conversations parked in the engine's conversation cache (needs `--conversation-cache-mib`)
 - `reused/requests` — engine-side prompt cache hit rate
-- `tok_s_mean` — rolling decode speed used for the load score
+- `tok_s_mean` — rolling decode speed, reported only while the engine generates
+- `busy` — the share of its slots in use lately (0 to 1, weighted toward the last 10 minutes), which new
+  conversations balance
 - `prefill_tok_s` — measured cold prefill speed (empty until a long enough streamed turn ran there)
+- `version`, `started` — the engine's version and start time (ms since the epoch), from its `/metrics`
+- `restarts` — restarts the router noticed; `slow` — answers whose first token was flagged slow (see `SLOW_FIRST_TOKEN`)
+- `direct` — requests running on the engine that the router didn't send; they count against `capacity`
+- `parks`, `evictions`, `cache_slots`, `reused_tokens/prompt_tokens` — the conversation cache's own counters, and
+  the share of prompt tokens it served
+- `activity` — what the engine reports it is working on (`state`, prompt progress, tokens written, speed), each with
+  the `key` of the conversation the router sent there when their start times match; `phase`; `slots` with what each
+  idle one keeps
+- `hardware` and `history` — the engine's GPU, PCIe, CPU and RAM readings, and the last minute of GPU load
+- `recent` — from the engine's last requests: median decode and prefill speed, expert cache hits, PCIe share and
+  draft acceptance
 - `poll_fails` — failed polls in a row
-- `capacity` — slots the router fills, the smaller of `MAX_INFLIGHT` and the batch slots; `inflight` passes it after an
-  overflow
+- `capacity` — slots the router fills, the smaller of `MAX_INFLIGHT` and the batch slots (less any taken by `direct`
+  requests); `inflight` passes it after an overflow
 - `claimed` — conversations holding out for this engine as their busy home
 - `conversations` — conversations whose home it is
 
 and globally: `cold` (new conversations, i.e. prefills), `migrated` (conversations whose home moved), `queued`
 (requests that waited for a slot), `waiting` (waiting right now), `overflow` (handed to a full engine after
-`MAX_QUEUE_WAIT`), `retried`, and
+`MAX_QUEUE_WAIT`), `retried`, `slow`, `restarts`, and
 `cached_tokens / prompt_tokens` — the ratio you should actually watch. Usage is read from JSON and SSE answers in
 chat, messages and responses shapes. A healthy setup has almost as many cold events as conversations, not as
 many as turns.
@@ -127,20 +156,33 @@ each conversation also carries `last_seen` (ms since the epoch) and `migrations`
 open `http://localhost:8000/dashboard`. it is part of `router.mjs`, polls the router every 1.5 s and loads nothing
 from anywhere else, so it works offline. it shows
 
-- the cache hit ratio and the requests waiting for a slot right now, above the router's counters
-- one card per engine: health, slots in use, its own queue, decode and prefill speed, its conversation cache, and
-  the conversations whose home it is, with turns, prompt size, last seen and how often each moved
-- routing decisions as they finish, newest first, under the requests still waiting or running; hovering a row
-  highlights that conversation everywhere on the page
+- the cache hit ratio, time to first token, requests waiting for a slot and throughput, with their recent trend,
+  above the router's counters
+- where requests ran over the last 2 min, 10 min or hour: one lane per engine, each request a bar from its slot to
+  its last byte, colored by conversation, with the time it waited for a slot as a thin line before it and spills,
+  retries, failures and slow first tokens outlined
+- one card per engine, with what Strata's own monitor shows: what each slot is doing (reading the prompt or writing
+  the answer, with progress and speed) and for which conversation, what idle slots keep, GPU load over the last
+  minute, VRAM, power, temperature, PCIe link and traffic, CPU and RAM; decode and prefill speed, draft acceptance
+  and expert cache hits from the engine's recent requests; version, uptime and restarts; its conversation cache
+  (reuse, parked, evictions); and the conversations whose home it is, with turns, prompt size, last seen and how
+  often each moved
+- routing decisions as they finish, newest first, under the requests still waiting or running
 
-each decision gets one kind, first match wins: `gone` (the client hung up), `failed`, `retry` (an engine failed
+hovering a request, a slot or a row highlights that conversation everywhere on the page, and fades the others in
+the timeline. Hovering a decision, counter, tile or reading explains it, and "What do these mean?" under the routing
+decisions lists every kind of decision.
+
+each decision gets one kind, first match wins: `gone` (the client hung up before the answer was complete; one that
+closes the connection right after the final event, as the OpenAI SDK does, got the whole answer), `failed`, `retry` (an engine failed
 before answering), `overflow`, `spill` (the home moved), `queued` (waited for a slot), `cold` (new conversation),
 `sticky`. when the router stops answering, the page says so and dims the last data it had.
 
 `GET /stats/events` gives each decision as `kind`, `key`, `turn`, `home` (where the conversation lived before),
-`backend`, `wait_ms`, `retry_from`/`retry_error`, `status`/`error`, token counts, `arrived` (ms since the epoch),
-`ttft_ms` (streamed answers only) and `ms`, the last two counted from arrival. Like `/stats`, the dashboard data
-carries conversation key hashes, never prompt text.
+`backend`, `wait_ms`, `retry_from`/`retry_error`, `status`/`error`, token counts, `arrived` and `started` (ms since
+the epoch; `started` is when it got its slot), `ttft_ms` (streamed answers only) and `ms`, the last two counted from
+arrival, and `engine_ttft_ms`, `expected_ttft_ms` and `slow` for the first token at the engine. Like `/stats`, the
+dashboard data carries conversation key hashes, never prompt text.
 
 ## systemd
 
@@ -219,8 +261,9 @@ keep the direct engine endpoints as a second provider so you can A/B a conversat
 
 ## notes on engine configuration
 
-- an engine with an API key (Strata wants one whenever it listens beyond 127.0.0.1) answers `/metrics` only with
-  that key, so put it in a file and point `STRATA_API_KEY_FILE` at it, or the router sees the engine as down. All
+- an engine with an API key answers `/metrics` only with that key, so put it in a file and point
+  `STRATA_API_KEY_FILE` at it, or the router sees the engine as down (some 0.2 releases insisted on a key beyond
+  127.0.0.1; current ones only recommend it). All
   engines share the one key. Clients still send the key on their own requests; the router never adds it, so it
   can't hand keyed engines to anyone who reaches the router
 - Strata refuses host names it doesn't know (DNS rebinding protection) with `403 Host ... is not allowed`. List
@@ -233,6 +276,8 @@ keep the direct engine endpoints as a second provider so you can A/B a conversat
 - set `PREFILL_TOK_S` to your measured cold prefill speed: it decides when waiting for a busy home beats moving
 - conversation parking (`--conversation-cache-mib 32768 --conversation-cache-slots 8`) is what makes spill and
   restore cheap; without it an evicted conversation must be fully re-prefilled
+- with Strata 0.2, `--conversation-cache-min-tokens 2048` keeps short side requests out of those slots, so they
+  don't evict long conversations
 - parking lives in host RAM: a parked 262k conversation is roughly 5 GB at int8, live KV is ~13.7 KB/token
 - thinking consumes the output budget: with reasoning on and a small `max_tokens` the engine can spend the whole
   budget on reasoning and return no answer (`the reply reached max tokens while still thinking`). Give agent calls
