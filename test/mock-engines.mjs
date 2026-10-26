@@ -6,6 +6,12 @@ export function makeEngine(name, port, batch = 2, latencyMs = 300) {
   const parked = 0;
 
   const server = http.createServer((req, res) => {
+    if (req.url === '/v1/models' || req.url === '/models') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ object: 'list', data: [{ id: 'fake', object: 'model', status: { value: 'loaded' } }] }));
+      return;
+    }
+
     if (req.url === '/metrics') {
       const slots = [];
       for (let i = 0; i < batch; i++) {

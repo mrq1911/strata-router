@@ -49,7 +49,9 @@ STRATA_BACKENDS="a=192.168.77.117:8080,b=192.168.77.198:8080" node router.mjs
 | `POST /v1/responses` | same routing (OpenAI Responses-style) |
 | `GET /health` | backend health, in-flight, queued |
 | `GET /stats` | counters, per-engine state, conversation homes |
-| `GET /v1/models` | proxied from the first healthy engine |
+| `GET /v1/models` | proxied from the first healthy engine (pi's model list needs this to show a provider as running) |
+| `GET /metrics`, `GET /status`, `GET /slots` | proxied to the first healthy engine |
+| `POST` to any other engine path (`/v1/vram`, `SAVE` sessions, ...) | proxied to the first healthy engine |
 
 ## routing rules
 

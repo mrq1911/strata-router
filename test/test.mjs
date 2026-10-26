@@ -28,7 +28,11 @@ const check = (label, cond, detail = '') => {
   if (!cond) failures++;
 };
 
-// 1. a conversation stays on one engine
+// 1. the model list is proxied (clients use it to show a provider as running)
+const models = await (await fetch(`${R}/v1/models`)).json();
+check('/v1/models proxied', Array.isArray(models.data) && models.data.length > 0, JSON.stringify(models.data));
+
+// 2. a conversation stays on one engine
 const conv = [{ role: 'system', content: ' terse ' }, { role: 'user', content: 'sticky conversation' }];
 const homes = new Set();
 for (let i = 0; i < 5; i++) {
@@ -39,17 +43,17 @@ for (let i = 0; i < 5; i++) {
 }
 check('conversation stays on one engine', homes.size === 1, [...homes].join('/'));
 
-// 2. a fork of that conversation inherits the same engine
+// 3. a fork of that conversation inherits the same engine
 const fork = await chat(conv.slice(0, 4).concat([{ role: 'user', content: 'branch here' }]));
 check('fork routed to the same engine', [...homes][0] === fork.backend, fork.backend);
 
-// 3. burst of 4 new conversations spreads 2 per engine
+// 4. burst of 4 new conversations spreads 2 per engine
 const burst = await Promise.all(Array.from({ length: 4 }, (_, i) => chat([{ role: 'user', content: `burst ${i}` }])));
 const counts = {};
 for (const r of burst) counts[r.backend] = (counts[r.backend] || 0) + 1;
 check('burst respects 2 slots per engine', Object.values(counts).every((c) => c <= 2), JSON.stringify(counts));
 
-// 4. kill engine A, requests still succeed
+// 5. kill engine A, requests still succeed
 A.server.closeAllConnections();
 A.server.close();
 await sleep(1500);
@@ -58,7 +62,7 @@ check('failover to the surviving engine', dead.backend === 'B' && !dead.error, `
 const health = await (await fetch(`${R}/health`)).json();
 check('dead engine reported unhealthy', health.backends.find((b) => b.name === 'A').healthy === false);
 
-// 5. queueing when everything is full
+// 6. queueing when everything is full
 const flood = await Promise.all(Array.from({ length: 6 }, (_, i) => chat([{ role: 'user', content: `flood ${i}` }])));
 check('all flood requests served despite saturation', flood.every((r) => r.text), `${flood.length} responses`);
 const st = await (await fetch(`${R}/stats`)).json();

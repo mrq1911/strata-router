@@ -300,8 +300,7 @@ async function handleChat(path, raw, res) {
 }
 
 function handleGet(res, path) {
-  if (path === '/' || path === '/health') {
-    res.writeHead(200, { 'content-type': 'application/json' });
+  if (path === '/' || path === '/health') {    res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({
       ok: config.backends.some((b) => b.healthy),
       backends: config.backends.map((b) => ({ name: b.name, host: `${b.host}:${b.port}`, healthy: b.healthy, inflight: b.inflight, queued: b.queued, running: b.running })),
@@ -334,11 +333,26 @@ function handleGet(res, path) {
     }));
     return;
   }
+  if (path === '/v1/models' || path === '/models') {
+    const b = config.backends.find((x) => x.healthy) || config.backends[0];
+    getJson(b, '/v1/models', config.connectTimeoutMs)
+      .then((m) => {
+        res.writeHead(200, { 'content-type': 'application/json', 'x-strata-backend': b.name });
+        res.end(JSON.stringify(m));
+      })
+      .catch((err) => {
+        res.writeHead(503, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: String(err.message || err), backend: b.name }));
+      });
+    return;
+  }
+
   res.writeHead(404, { 'content-type': 'application/json' });
   res.end(JSON.stringify({ error: 'not found' }));
 }
 
 const CHAT_PATHS = new Set(['/v1/chat/completions', '/v1/messages', '/v1/responses']);
+const KNOWN = new Set(['/', '/health', '/stats', '/v1/models', '/models']);
 
 const server = http.createServer((req, res) => {
   const path = req.url || '/';
@@ -350,7 +364,40 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (req.method === 'GET') { handleGet(res, path); return; }
+  if (req.method === 'GET') {
+    if (KNOWN.has(path)) { handleGet(res, path); return; }
+    // engine introspection (/metrics, /status, /slots) proxied to the first healthy engine
+    const b = config.backends.find((x) => x.healthy);
+    if (!b) {
+      res.writeHead(503, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'no healthy backend' }));
+      return;
+    }
+    getJson(b, path, config.connectTimeoutMs)
+      .then((m) => {
+        res.writeHead(200, { 'content-type': 'application/json', 'x-strata-backend': b.name });
+        res.end(JSON.stringify(m));
+      })
+      .catch((err) => {
+        res.writeHead(502, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: String(err.message || err), backend: b.name }));
+      });
+    return;
+  }
+
+  // anything else the engine exposes (/v1/vram, /slots, /status, ...) proxied to the first healthy engine
+  if (req.method === 'POST' && !KNOWN.has(path)) {
+    const b = config.backends.find((x) => x.healthy);
+    if (!b) {
+      res.writeHead(503, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'no healthy backend' }));
+      return;
+    }
+    let raw = '';
+    req.on('data', (c) => (raw += c));
+    req.on('end', () => forward(b, path, raw, res));
+    return;
+  }
 
   res.writeHead(405, { 'content-type': 'application/json' });
   res.end(JSON.stringify({ error: 'method not allowed' }));
