@@ -1133,7 +1133,7 @@ h4 { font-size: 12px; font-weight: 600; color: var(--ink-2); }
 button { font: inherit; font-size: 12px; color: var(--ink-2); background: var(--surface); border: 1px solid var(--ring); border-radius: 7px; padding: 3px 10px; cursor: pointer; }
 button:hover { color: var(--ink); }
 .seg { display: inline-flex; border: 1px solid var(--ring); border-radius: 7px; overflow: hidden; }
-.seg button { border: 0; border-radius: 0; background: none; padding: 3px 9px; }
+.seg button { border: 0; border-radius: 0; background: none; padding: 3px 9px; white-space: nowrap; }
 .seg button[aria-pressed=true] { background: var(--track); color: var(--ink); }
 #theme { margin-left: auto; }
 #banner { margin: 0 22px 12px; padding: 9px 12px; border: 1px solid var(--critical); border-radius: 10px; background: var(--surface); }
@@ -1186,17 +1186,19 @@ main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(540px, 700px)
 .title { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .pill { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; padding: 2px 9px; border-radius: 999px; background: var(--sunken); border: 1px solid var(--ring); white-space: nowrap; }
 .tag { font-size: 11px; color: var(--ink-2); background: var(--sunken); border: 1px solid var(--ring); border-radius: 5px; padding: 0 6px; white-space: nowrap; }
-.badges { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.badges { display: flex; gap: 5px; min-width: 0; overflow: hidden; justify-content: flex-end; }
+.badges .pill { flex: none; }
+.one { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .down .tiles, .down .slots, .down .convs { opacity: .55; }
-.err { color: var(--ink-2); overflow-wrap: anywhere; margin-top: 6px; font-size: 12px; }
+.meta.err { color: var(--critical); }
 .slots { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 6px; margin: 12px 0 6px; }
-.slot { min-width: 0; padding: 7px 9px; border-radius: 8px; border: 1px dashed var(--grid); color: var(--muted); font-size: 12px; }
+.slot { display: grid; grid-template-rows: 18px 18px 8px; align-content: start; height: 62px; min-width: 0; overflow: hidden; padding: 7px 9px; border-radius: 8px; border: 1px dashed var(--grid); color: var(--muted); font-size: 12px; }
 .slot.busy { border: 1px solid var(--ring); background: var(--sunken); color: var(--ink); }
 .slot .top { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .slot .key { overflow: hidden; text-overflow: ellipsis; }
 .slot .meta { margin-left: auto; white-space: nowrap; }
-.slot .what { color: var(--ink-2); font-size: 11px; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.slot .meter.sm { margin-top: 5px; }
+.slot .what { color: var(--ink-2); font-size: 11px; line-height: 18px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.slot .meter.sm { margin-top: 3px; height: 4px; }
 .hw { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px 14px; margin: 12px 0 0; padding: 10px 0 0; border-top: 1px solid var(--grid); font-size: 12px; }
 .hw .label { font-size: 11px; }
 .hw b { display: block; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -1218,9 +1220,14 @@ td.key .swatch { margin-right: 6px; }
 .feed h2 { margin-bottom: 10px; }
 .mix { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-bottom: 10px; }
 .mix .zero { opacity: .5; }
-.scroll { overflow: auto; min-height: 0; margin: 0 -10px; padding: 0 4px; }
-.feed table { font-size: 12px; }
-.route { max-width: 140px; overflow: hidden; text-overflow: ellipsis; }
+.scroll { overflow-y: auto; overflow-x: hidden; min-height: 0; margin: 0 -10px; padding: 0 4px; }
+.feed { container-type: inline-size; }
+.feed table { font-size: 12px; table-layout: fixed; }
+.feed th, .feed td { overflow: hidden; text-overflow: ellipsis; }
+.feed .note td { overflow: visible; }
+.c-kind { width: 76px; } .c-key { width: 88px; } .c-turn { width: 38px; } .c-num { width: 52px; } .c-time { width: 66px; } .c-fin { width: 62px; }
+@container (max-width: 600px) { .c-fin { display: none; } }
+@container (max-width: 500px) { .c-cached, .c-turn { display: none; } }
 .has-note td { border-bottom: 0; }
 .tip { position: fixed; z-index: 10; max-width: 360px; padding: 7px 10px; border-radius: 8px; background: var(--ink); color: var(--surface); font-size: 12px; line-height: 1.45; white-space: pre-line; pointer-events: none; box-shadow: 0 4px 16px rgba(0, 0, 0, .18); }
 .help { margin: -4px 0 10px; }
@@ -1307,7 +1314,8 @@ td.key .swatch { margin-right: 6px; }
 <details class="help"><summary>What do these mean?</summary><dl id="help-list"></dl></details>
 <div class="scroll">
 <table>
-<thead><tr><th>Decision</th><th>Conversation</th><th class="r">Turn</th><th>Engine</th><th class="r">Prompt</th><th class="r">Cached</th><th class="r">Wait</th><th class="r">1st token</th><th class="r">Total</th><th class="r">Finished</th></tr></thead>
+<colgroup><col class="c-kind"><col class="c-key"><col class="c-turn"><col><col class="c-num"><col class="c-num c-cached"><col class="c-num"><col class="c-time"><col class="c-num"><col class="c-fin"></colgroup>
+<thead><tr><th>Decision</th><th>Conversation</th><th class="r c-turn">Turn</th><th>Engine</th><th class="r">Prompt</th><th class="r c-cached">Cached</th><th class="r">Wait</th><th class="r">1st token</th><th class="r">Total</th><th class="r c-fin">Finished</th></tr></thead>
 <tbody id="live"></tbody>
 <tbody id="rows"></tbody>
 </table>
@@ -1578,7 +1586,7 @@ function timeline(st) {
     if (lanes.has(x.backend)) lanes.get(x.backend).push({ key: x.key, t0: x.arrived, ts: x.started || x.arrived, t1: end, x });
     else if (!x.backend) waiting.push({ key: x.key, t0: x.arrived, ts: end, t1: end, x });
   }
-  if (waiting.length) lanes.set('', waiting);
+  lanes.set('', waiting);
 
   const kids = [];
   let y = 0, n = 0;
@@ -1586,15 +1594,16 @@ function timeline(st) {
   for (const [name, items] of lanes) {
     const b = st.backends.find((x) => x.name === name);
     items.sort((m, k) => m.t0 - k.t0);
+    // a fixed number of rows per lane, so the page below doesn't move; past that, bars share the row that frees first
+    const rows = b ? Math.max(2, b.batch) + 2 : 2;
     const ends = [];
     for (const it of items) {
       let r = ends.findIndex((t) => t <= it.t0);
-      if (r < 0 && ends.length < 6) r = ends.push(0) - 1;
+      if (r < 0 && ends.length < rows) r = ends.push(0) - 1;
       if (r < 0) r = ends.indexOf(Math.min(...ends));
       ends[r] = Math.max(ends[r], it.t1);
       it.row = r;
     }
-    const rows = Math.max(ends.length, b ? b.capacity : 1);
     const lh = rows * (BAR + GAP) + GAP + 8;
     laneKids.push(s('rect', { class: 'lane-bg', x: LW, y, width: W - LW - PAD, height: Math.max(lh, 34), rx: 6 }));
     laneKids.push(s('text', { class: 'lane-name', x: 0, y: y + 15 }, name || 'Waiting'));
@@ -1659,10 +1668,17 @@ function work(a, direct) {
   const full = reading ? 'Reading a ' + toks(a.prompt_tokens) + '-token prompt' : 'Answering: ' + whole.format(a.generated || 0) + ' tokens so far' + (a.tok_s ? ', ' + rate(a.tok_s) : '');
   const progress = reading ? (a.prompt_read != null && total ? a.prompt_read / total : null) : a.max_tokens ? (a.generated || 0) / a.max_tokens : null;
   const who = a.key ? 'Conversation ' + a.key : direct ? 'Sent to the engine directly, not through the router, which counts this slot as taken.' : 'A request the router couldn’t match to one it sent.';
-  return h('div', { class: 'slot busy', 'data-key': a.key || null, 'data-tip': who + '\n' + full + (progress != null ? ' (' + Math.round(100 * progress) + '%)' : '') },
-    h('div', { class: 'top' }, a.key ? [swatch(a.key), h('span', { class: 'key' }, a.key.slice(0, 8))] : direct ? [icon('bolt', 'warning'), h('span', null, 'direct')] : h('span', null, 'request'), h('span', { class: 'meta' }, a.elapsed_s != null ? dur(a.elapsed_s * 1000) : '')),
+  return slotBox('slot busy', a.key, who + '\n' + full + (progress != null ? ' (' + Math.round(100 * progress) + '%)' : ''),
+    a.key ? [swatch(a.key), h('span', { class: 'key' }, a.key.slice(0, 8))] : direct ? [icon('bolt', 'warning'), h('span', null, 'direct')] : h('span', null, 'request'),
+    a.elapsed_s != null ? dur(a.elapsed_s * 1000) : '', what, progress);
+}
+
+// every slot box has the same three lines, so the card doesn't jump as slots fill and empty
+function slotBox(cls, key, tip, label, age, what, progress) {
+  return h('div', { class: cls, 'data-key': key || null, 'data-tip': tip },
+    h('div', { class: 'top' }, label, h('span', { class: 'meta' }, age)),
     h('div', { class: 'what' }, what),
-    progress != null && h('span', { class: 'meter sm' }, h('i', { style: { width: Math.min(100, 100 * progress) + '%' } })));
+    h('span', { class: 'meter sm', style: { visibility: progress == null ? 'hidden' : null } }, h('i', { style: { width: Math.min(100, 100 * (progress || 0)) + '%' } })));
 }
 
 const gib = (bytes) => (bytes / 2 ** 30).toFixed(1);
@@ -1690,6 +1706,9 @@ function hardware(b) {
   return h('div', { class: 'hw' }, cells);
 }
 
+// a line that never wraps: what doesn't fit is cut, and the whole text is in its tooltip
+const oneLine = (cls, text) => h('div', { class: cls + ' one', 'data-tip': text }, text);
+
 function engine(b, list, active, top) {
   const [ic, tone, word] = !b.healthy ? ['failed', 'critical', 'Down'] : b.state === 'unloaded' ? ['warn', 'warning', 'Model unloaded'] : b.poll_fails ? ['warn', 'warning', b.poll_fails + ' failed poll' + (b.poll_fails > 1 ? 's' : '')] : ['sticky', 'good', 'Healthy'];
   const rec = b.recent || {};
@@ -1699,28 +1718,32 @@ function engine(b, list, active, top) {
   const unseen = live.filter((x) => x.backend === b.name && !matched.has(x.key));
   const idle = (b.slots || []).filter((x) => x.state === 'idle');
   let direct = b.direct || 0;
-  const boxes = acts.map((a) => work(a, !a.key && direct-- > 0)).concat(unseen.map((x) => h('div', { class: 'slot busy', 'data-key': x.key, 'data-tip': 'Conversation ' + x.key + '\nSent by the router; the engine’s next report will show what it is doing.' },
-    h('div', { class: 'top' }, swatch(x.key), h('span', { class: 'key' }, x.key.slice(0, 8)), h('span', { class: 'meta' }, dur(now() - (x.started || x.arrived)))),
-    h('div', { class: 'what' }, 'sent, not in the engine’s report yet'))));
-  for (let i = 0; boxes.length < b.capacity; i++) {
+  const busy = acts.map((a) => work(a, !a.key && direct-- > 0)).concat(unseen.map((x) => slotBox('slot busy', x.key, 'Conversation ' + x.key + '\nSent by the router; the engine’s next report will show what it is doing.',
+    [swatch(x.key), h('span', { class: 'key' }, x.key.slice(0, 8))], dur(now() - (x.started || x.arrived)), 'starting', null)));
+  // one box per engine slot, always; more requests than slots only show in the line below
+  const n = Math.max(1, b.batch);
+  const boxes = busy.slice(0, n);
+  const more = busy.length - boxes.length;
+  for (let i = 0; boxes.length < n; i++) {
     const held = idle[i] && idle[i].held_tokens;
-    boxes.push(h('div', { class: 'slot', 'data-tip': held > 0 ? 'Free. It still holds the KV of the last conversation it served, so that conversation’s next turn can start at once.' : 'Free.' }, h('div', { class: 'top' }, 'idle slot'), held > 0 && h('div', { class: 'what' }, 'keeps ' + toks(held) + ' tokens')));
+    boxes.push(slotBox('slot', null, held > 0 ? 'Free. It still holds the KV of the last conversation it served, so that conversation’s next turn can start at once.' : 'Free.', 'idle slot', '', held > 0 ? 'keeps ' + toks(held) + ' tokens' : 'free', null));
   }
   const reuse = b.prompt_tokens ? b.reused_tokens / b.prompt_tokens : b.requests ? b.reused / b.requests : null;
-  const meta = [b.host, b.started && 'up ' + dur(now() - b.started), count(b.routed) + ' routed'].filter(Boolean).join(' · ') + ' · ';
+  const meta = ' · ' + [b.started && 'up ' + dur(now() - b.started), count(b.routed) + ' routed', b.host].filter(Boolean).join(' · ');
   const badges = [
-    b.restarts > 0 && h('span', { class: 'pill', 'data-tip': FLAGS.restarts[2] }, icon('retry', 'warning'), 'restarted ' + b.restarts + '×'),
-    b.slow > 0 && h('span', { class: 'pill', 'data-tip': FLAGS.slow[2] }, icon('warn', 'serious'), b.slow + ' slow first token' + (b.slow > 1 ? 's' : '')),
-    b.direct > 0 && h('span', { class: 'pill', 'data-tip': 'Requests sent to this engine directly, not through the router. Their slots count as taken, so routed requests wait or go elsewhere instead of queueing inside the engine.' }, icon('bolt', 'warning'), b.direct + ' used directly'),
-    b.claimed > 0 && h('span', { class: 'pill', 'data-tip': 'Conversations waiting for this engine because it holds their cache; for a moment they keep its next free slot from newcomers.' }, icon('queued', 'warning'), b.claimed + ' waiting for it'),
+    b.restarts > 0 && h('span', { class: 'pill', 'data-tip': FLAGS.restarts[2] }, icon('retry', 'warning'), b.restarts + '×'),
+    b.slow > 0 && h('span', { class: 'pill', 'data-tip': b.slow + ' slow first token' + (b.slow > 1 ? 's' : '') + '. ' + FLAGS.slow[2] }, icon('warn', 'serious'), b.slow + ' slow'),
+    b.direct > 0 && h('span', { class: 'pill', 'data-tip': 'Requests sent to this engine directly, not through the router. Their slots count as taken, so routed requests wait or go elsewhere instead of queueing inside the engine.' }, icon('bolt', 'warning'), b.direct + ' direct'),
+    b.claimed > 0 && h('span', { class: 'pill', 'data-tip': 'Conversations waiting for this engine because it holds their cache; for a moment they keep its next free slot from newcomers.' }, icon('queued', 'warning'), b.claimed + ' waiting'),
   ].filter(Boolean);
   return h('article', { class: b.healthy ? 'card' : 'card down' },
-    h('div', { class: 'head' }, h('div', { class: 'title' }, h('h3', null, b.name), b.version && h('span', { class: 'tag', title: 'Engine version' }, b.version)), h('span', { class: 'pill' }, icon(ic, tone), word)),
-    h('div', { class: 'meta' }, meta, h('span', { 'data-tip': 'Share of its slots in use lately, direct requests included, weighted toward the last 10 minutes. A new conversation goes to the engine with the most free slots, and between equals to the one busy least lately, so both boxes work about as long.' }, 'busy ' + pct(b.busy) + ' lately')),
-    b.lastError && h('div', { class: 'err' }, b.lastError),
-    badges.length > 0 && h('div', { class: 'badges' }, badges),
+    h('div', { class: 'head' }, h('div', { class: 'title' }, h('h3', null, b.name), b.version && h('span', { class: 'tag', 'data-tip': 'Engine version' }, b.version)),
+      h('div', { class: 'badges' }, badges, h('span', { class: 'pill', 'data-tip': b.lastError || null }, icon(ic, tone), word))),
+    b.lastError
+      ? oneLine('meta err', b.lastError)
+      : h('div', { class: 'meta one' }, h('span', { 'data-tip': 'Share of its slots in use lately, direct requests included, weighted toward the last 10 minutes. A new conversation goes to the engine with the most free slots, and between equals to the one busy least lately, so both boxes work about as long.' }, 'busy ' + pct(b.busy) + ' lately'), meta),
     h('div', { class: 'slots' }, boxes),
-    h('div', { class: 'hint' }, [b.phase || b.state, b.running + ' running', b.direct > 0 && b.direct + ' sent directly', b.queued + ' queued in the engine', 'batch ' + b.batch].filter(Boolean).join(' · ')),
+    oneLine('hint', [b.phase || b.state, b.running + ' running', more > 0 && more + ' more than its slots', b.direct > 0 && b.direct + ' sent directly', b.queued + ' queued in the engine', 'batch ' + b.batch].filter(Boolean).join(' · ')),
     hardware(b),
     h('div', { class: 'tiles' },
       tile('Decode', rate(rec.decode_tok_s ?? decodeOf(b)), rec.draft_accept != null ? pct(rec.draft_accept) + ' of drafts kept' : 'recent answers', null,
@@ -1773,14 +1796,14 @@ function row(e) {
   const tr = h('tr', { class: note && 'has-note', 'data-key': e.key },
     h('td', { 'data-tip': explain(kind) }, icon(kind, tone), ' ' + (kind === 'failed' && e.status ? 'failed ' + e.status : kind)),
     h('td', { class: 'key', title: e.key }, swatch(e.key), e.key.slice(0, 8)),
-    h('td', { class: 'r' }, e.turn),
-    h('td', { class: 'route', title: route(e) }, route(e)),
+    h('td', { class: 'r c-turn' }, e.turn),
+    h('td', { 'data-tip': route(e) }, route(e)),
     h('td', { class: 'r' }, toks(e.prompt_tokens)),
-    h('td', { class: 'r' }, e.prompt_tokens ? Math.round((100 * e.cached_tokens) / e.prompt_tokens) + '%' : '–'),
+    h('td', { class: 'r c-cached' }, e.prompt_tokens ? Math.round((100 * e.cached_tokens) / e.prompt_tokens) + '%' : '–'),
     h('td', { class: 'r' }, e.queued ? dur(e.wait_ms) : '–'),
     h('td', { class: 'r' }, e.slow && [icon('warn', 'serious'), ' '], dur(e.ttft_ms)),
     h('td', { class: 'r' }, dur(e.ms)),
-    h('td', { class: 'r muted' }, clock(e.arrived + e.ms)));
+    h('td', { class: 'r muted c-fin' }, clock(e.arrived + e.ms)));
   return note ? [tr, h('tr', { class: 'note', 'data-key': e.key }, h('td'), h('td', { colspan: 9 }, note))] : [tr];
 }
 
@@ -1790,14 +1813,14 @@ function liveRow(x) {
   return h('tr', { 'data-key': x.key },
     h('td', null, waiting ? icon('queued', 'warning') : icon('sticky', 'accent pulse'), waiting ? ' waiting' : ' running'),
     h('td', { class: 'key', title: x.key }, swatch(x.key), x.key.slice(0, 8)),
-    h('td', { class: 'r' }, x.turn),
-    h('td', { class: 'route' }, waiting ? (x.home ? 'home ' + x.home : 'new') : route(x)),
+    h('td', { class: 'r c-turn' }, x.turn),
+    h('td', null, waiting ? (x.home ? 'home ' + x.home : 'new') : route(x)),
     h('td', { class: 'r' }, '–'),
-    h('td', { class: 'r' }, '–'),
+    h('td', { class: 'r c-cached' }, '–'),
     h('td', { class: 'r' }, waiting ? dur(age) : x.started ? dur(x.started - x.arrived) : '–'),
     h('td', { class: 'r' }, '–'),
     h('td', { class: 'r' }, dur(age)),
-    h('td', { class: 'r muted' }, '…'));
+    h('td', { class: 'r muted c-fin' }, '…'));
 }
 
 function status() {
