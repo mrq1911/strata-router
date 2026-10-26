@@ -1,6 +1,6 @@
 # strata-router
 
-one OpenAI-compatible endpoint in front of several [Strata](https://github.com/strata-ai/strata) engines, with
+one OpenAI-compatible endpoint in front of several Strata engines, with
 **conversation-sticky routing** so each conversation keeps its KV cache on the engine that warmed it.
 
     clients ──> http://localhost:8000/v1 ──┬──> engine A  (home of conversation 1, 2)
@@ -16,15 +16,16 @@ four at ~31 tok/s each (124 tok/s aggregate). More concurrency does **not** buy 
 
 What does buy throughput is cache: a conversation that stays on the engine that already holds its KV reuses the
 prefix cache. A conversation that lands on a different engine pays a cold prefill — at ~1,400 tok/s, a 262k
-context takes about 190 s. That single event is forty times more expensive than everything else in a turn.
+context takes about 190 s. That single event costs more than ten average agent turns
+([measurements](docs/measurements.md)).
 
-So the router does one thing: keep conversations on their home engine, and only spill when that engine has no
-free slot or is unhealthy.
+So the router does one thing: keep conversations on their home engine, and only spill when that engine is down
+or stays busy longer than the cold prefill would take.
 
 ## run
 
 ```bash
-STRATA_BACKENDS="a=192.168.77.117:8080,b=192.168.77.198:8080" node router.mjs
+STRATA_BACKENDS="a=10.0.0.1:8080,b=10.0.0.2:8080" node router.mjs
 ```
 
 | env | default | meaning |
@@ -33,11 +34,14 @@ STRATA_BACKENDS="a=192.168.77.117:8080,b=192.168.77.198:8080" node router.mjs
 | `PORT` | `8000` | listen port |
 | `BIND` | `0.0.0.0` | listen address |
 | `POLL_MS` | `2000` | how often to read `GET /metrics` from each engine |
-| `MAX_INFLIGHT` | `2` | per-engine cap; match the engine's `--batch N` |
-| `MAX_QUEUE_WAIT` | `30000` | how long to wait for a free slot before letting the engine queue it |
-| `CONNECT_TIMEOUT` | `10000` | connect timeout to an engine |
-| `READ_TIMEOUT` | `300000` | per-request read timeout (long prefills need it) |
+| `MAX_INFLIGHT` | `2` | per-engine cap; the router uses the smaller of this and the engine's reported batch slots |
+| `MAX_QUEUE_WAIT` | `30000` | how long to wait for a free slot before handing the request to an engine's own queue |
+| `PREFILL_TOK_S` | `1400` | cold prefill speed; decides how long a conversation waits for its busy home before spilling |
+| `CONNECT_TIMEOUT` | `10000` | TCP connect timeout to an engine; a failed connect marks it unhealthy until the next good poll |
+| `READ_TIMEOUT` | `300000` | idle timeout on an engine response (long prefills need it) |
 | `MAX_CONVERSATIONS` | `500` | size of the conversation map (LRU) |
+| `PASSTHROUGH` | all | comma-separated POST paths the router relays to the engine; anything else gets 404 |
+| `STATE_FILE` | none | keeps conversation homes across restarts (written every minute and on shutdown) |
 | `LOG` | on | set `LOG=off` to silence per-request lines |
 
 ## endpoints
@@ -45,23 +49,33 @@ STRATA_BACKENDS="a=192.168.77.117:8080,b=192.168.77.198:8080" node router.mjs
 | path | behaviour |
 |---|---|
 | `POST /v1/chat/completions` | routed; SSE streamed untouched; response carries `x-strata-backend` |
+| `POST /v1/completions` | same routing, keyed on the prompt prefix |
 | `POST /v1/messages` | same routing (Anthropic-style payloads) |
 | `POST /v1/responses` | same routing (OpenAI Responses-style) |
 | `GET /health` | backend health, in-flight, queued |
 | `GET /stats` | counters, per-engine state, conversation homes |
-| `GET /v1/models` | proxied from the first healthy engine (pi's model list needs this to show a provider as running) |
-| `GET /metrics`, `GET /status`, `GET /slots` | proxied to the first healthy engine |
-| `POST` to any other engine path (`/v1/vram`, `SAVE` sessions, ...) | proxied to the first healthy engine |
+| `GET /v1/models` (and `/models`) | proxied from the first healthy engine (pi's model list needs this to show a provider as running) |
+| any other `GET` (`/metrics`, `/status`, `/slots`, ...) | proxied to the first healthy engine, status and body as the engine sent them |
+| `POST` to any other engine path (`/v1/vram`, `SAVE` sessions, ...) | proxied to the first healthy engine; set `PASSTHROUGH` to whitelist paths, since the router listens on all interfaces without auth |
 
 ## routing rules
 
-- **conversation key** = `model | system prompt | first user message` (first 4k chars). Forks and branches of a
-  conversation share the key, so they inherit the same home engine and reuse the prefix cache.
+- **conversation key** = hash of `model | system prompt | first user message` (first 4k chars; the prompt prefix
+  for `/v1/completions`). Forks and branches of a conversation share the key, so they inherit the same home
+  engine and reuse the prefix cache.
 - **sticky** while the home engine is healthy, has an empty queue and a free batch slot.
-- **spill** to the least-loaded healthy engine otherwise; the home moves with the conversation.
-- **queue** up to `MAX_QUEUE_WAIT` when every engine is full, then fall through to the engine's own queue.
-- **retry** once on another engine only for connect errors, timeouts or 5xx **before the first token**; a
-  failure mid-stream is never retried, because the client already saw partial output.
+- **patient** when the home is busy: wait for its slot as long as a cold prefill of the conversation would take
+  elsewhere (last turn's prompt tokens ÷ `PREFILL_TOK_S`, capped at `MAX_QUEUE_WAIT`). New conversations don't wait.
+- **spill** to the least-loaded engine with a free slot after that, or right away when the home is down; the home
+  moves with the conversation.
+- **queue** up to `MAX_QUEUE_WAIT` when every engine is full, first come first served, then hand the request to
+  the home engine's own queue.
+- **fail fast** with 503 when no engine has been healthy for a poll interval, instead of queueing.
+- **retry** once on another engine for connect errors, connect timeouts and 5xx answers, only while nothing has
+  reached the client. Once the response has started, an engine failure cuts the client connection, so a
+  truncated answer shows up as an error rather than a short reply. With nowhere to retry, the engine's own
+  error is passed on.
+- **cancel**: a client that disconnects aborts the engine request and frees its slot.
 
 ## what the metrics mean
 
@@ -72,31 +86,37 @@ STRATA_BACKENDS="a=192.168.77.117:8080,b=192.168.77.198:8080" node router.mjs
 - `reused/requests` — engine-side prompt cache hit rate
 - `tok_s_mean` — rolling decode speed used for the load score
 
-and globally: `cold` (new conversations, i.e. prefills), `migrated` (spill events), `queued`, `overflow`, and
-`cached_tokens / prompt_tokens` — the ratio you should actually watch. A healthy setup has almost as many cold
-events as conversations, not as many as turns.
+and globally: `cold` (new conversations, i.e. prefills), `migrated` (conversations whose home moved), `queued`
+(requests that waited for a slot), `overflow` (handed to a full engine after `MAX_QUEUE_WAIT`), `retried`, and
+`cached_tokens / prompt_tokens` — the ratio you should actually watch. Usage is read from JSON and SSE answers in
+chat, messages and responses shapes. A healthy setup has almost as many cold events as conversations, not as
+many as turns.
 
 ## systemd
 
 ```bash
+sudo install -Dm644 router.mjs /opt/strata-router/router.mjs
 sudo cp systemd/strata-router.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now strata-router
 journalctl -u strata-router -f
 ```
 
+the unit runs as a dynamic user and keeps conversation homes in `/var/lib/strata-router`.
+
 ## docker
 
 ```bash
 docker build -t strata-router .
-docker run -d -p 8000:8000 -e STRATA_BACKENDS="a=10.0.0.1:8080,b=10.0.0.2:8080" strata-router
+docker run -d -p 8000:8000 -v strata-router:/data -e STATE_FILE=/data/homes.json \
+  -e STRATA_BACKENDS="a=10.0.0.1:8080,b=10.0.0.2:8080" strata-router
 ```
 
 ## test without a GPU
 
 ```bash
-node test/mock-engines.mjs   # two fake engines
-node test/test.mjs           # stickiness, spill, failover, queueing
+node test/test.mjs           # stickiness, spill, failover, queueing, failure modes
+node test/mock-engines.mjs   # two fake engines on :9101 and :9102, to poke at by hand
 ```
 
 ## pointing a client at it
@@ -119,7 +139,10 @@ pi (`~/.pi/agent/models.json`):
           "reasoning": true,
           "contextWindow": 262144,
           "maxTokens": 32768,
-          "compat": { "thinkingFormat": "chat-template" }
+          "compat": {
+            "thinkingFormat": "chat-template",
+            "chatTemplateKwargs": { "enable_thinking": { "$var": "thinking.enabled" } }
+          }
         }
       ]
     }
@@ -127,15 +150,18 @@ pi (`~/.pi/agent/models.json`):
 }
 ```
 
-and in `settings.json`: `"defaultProvider": "strata"`, plus a per-model thinking level if the engine
-supports the chat-template thinking flags. opencode uses the same idea with
+`chatTemplateKwargs` is what carries pi's thinking level into the chat template (Qwen templates read
+`enable_thinking`); with `chat-template` alone pi sends no thinking flags. In `settings.json`:
+`"defaultProvider": "strata"`. opencode uses the same idea with
 `"npm": "@ai-sdk/openai-compatible"` and `"options": { "baseURL": "http://localhost:8000/v1" }`.
 
 keep the direct engine endpoints as a second provider so you can A/B a conversation against the router.
 
 ## notes on engine configuration
 
-- set `MAX_INFLIGHT` equal to the engine's `--batch` value, otherwise the router under- or over-fills it
+- the router fills each engine up to the smaller of `MAX_INFLIGHT` and the engine's reported batch slots; raise
+  `MAX_INFLIGHT` when you run `--batch` above 2
+- set `PREFILL_TOK_S` to your measured cold prefill speed: it decides when waiting for a busy home beats moving
 - conversation parking (`--conversation-cache-mib 32768 --conversation-cache-slots 8`) is what makes spill and
   restore cheap; without it an evicted conversation must be fully re-prefilled
 - parking lives in host RAM: a parked 262k conversation is roughly 5 GB at int8, live KV is ~13.7 KB/token

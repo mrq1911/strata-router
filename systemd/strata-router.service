@@ -1,5 +1,6 @@
 [Unit]
 Description=Strata router: conversation-sticky routing across Strata engines
+Wants=network-online.target
 After=network-online.target
 
 [Service]
@@ -9,6 +10,9 @@ Environment=STRATA_BACKENDS=a=127.0.0.1:8080,b=127.0.0.1:8081
 Environment=PORT=8000
 Environment=POLL_MS=2000
 Environment=MAX_INFLIGHT=2
+Environment=STATE_FILE=/var/lib/strata-router/homes.json
+DynamicUser=yes
+StateDirectory=strata-router
 Restart=always
 RestartSec=3
 

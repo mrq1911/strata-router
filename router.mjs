@@ -1,9 +1,14 @@
 #!/usr/bin/env node
 // strata-router: one OpenAI-compatible endpoint in front of several strata engines.
-// conversations stay pinned to the engine that holds their KV; spill only when that
-// engine has no free batch slot or is unhealthy. node >= 20, no dependencies.
+// conversations stay pinned to the engine that holds their KV; they spill only when that
+// engine is down or stays busy longer than a cold prefill elsewhere would take.
+// node >= 20, no dependencies.
 
 import http from 'node:http';
+import fs from 'node:fs';
+import { createHash } from 'node:crypto';
+import { StringDecoder } from 'node:string_decoder';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 const DEFAULT_BACKENDS = process.env.STRATA_BACKENDS || '127.0.0.1:8080';
 
@@ -16,6 +21,9 @@ const config = {
   connectTimeoutMs: Number(process.env.CONNECT_TIMEOUT || 10000),
   readTimeoutMs: Number(process.env.READ_TIMEOUT || 300000),
   maxConversations: Number(process.env.MAX_CONVERSATIONS || 500),
+  prefillTokS: Number(process.env.PREFILL_TOK_S || 1400),
+  passthrough: new Set((process.env.PASSTHROUGH || '').split(',').map((s) => s.trim()).filter(Boolean)),
+  stateFile: process.env.STATE_FILE || '',
   verbose: process.env.LOG !== 'off',
 };
 
@@ -49,14 +57,21 @@ function parseBackends(spec) {
     });
 }
 
-const home = new Map(); // conversation key -> backend name
-const meta = new Map(); // conversation key -> { turns, prompt, first }
+const ROUTED = new Set(['/v1/chat/completions', '/v1/completions', '/v1/messages', '/v1/responses']);
+const LOCAL = new Set(['/', '/health', '/stats']);
+const HOP = new Set(['connection', 'keep-alive', 'transfer-encoding', 'te', 'trailer', 'upgrade', 'proxy-authenticate', 'proxy-authorization']);
+const MAX_BODY = 20_000_000;
+// a fresh connection per request, so a stale keep-alive socket can't fail (and spill) a turn
+const agent = new http.Agent({ keepAlive: false });
+
+const convs = new Map(); // conversation key -> { backend, turns, prompt_tokens, first, model }, least recently used first
 const stats = {
   requests: 0,
   cold: 0,
   migrated: 0,
   queued: 0,
   overflow: 0,
+  retried: 0,
   errors: 0,
   prompt_tokens: 0,
   completion_tokens: 0,
@@ -68,40 +83,65 @@ const log = (msg) => { if (config.verbose) console.log(new Date().toISOString().
 
 function getJson(b, path, timeout = 5000) {
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: b.host, port: b.port, path, method: 'GET', timeout }, (res) => {
-      let buf = '';
-      res.on('data', (c) => (buf += c));
+    const req = http.request({ host: b.host, port: b.port, path, method: 'GET', timeout, agent }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
       res.on('end', () => {
-        try { resolve(JSON.parse(buf)); } catch (err) { reject(err); }
+        if (res.statusCode !== 200) return reject(new Error(`${path} answered ${res.statusCode}`));
+        try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); } catch (err) { reject(err); }
       });
+      res.on('error', reject);
     });
     req.on('error', reject);
     req.on('timeout', () => req.destroy(new Error('poll timeout')));
+    req.on('close', () => { if (!req.res?.complete) reject(new Error('poll connection closed')); });
     req.end();
   });
 }
 
-async function poll() {
-  for (const b of config.backends) {
-    try {
-      const m = await getJson(b, '/metrics');
-      const live = m.live || {};
-      b.healthy = true;
-      b.lastError = null;
-      b.lastPoll = Date.now();
-      b.slots = live.slots || [];
-      b.running = live.running || 0;
-      b.queued = live.queued || 0;
-      b.batch = m.engine?.batch_slots ?? 2;
-      b.tok_s_mean = live.tok_s_mean ?? null;
-      b.held_tokens = (live.slots || []).reduce((s, x) => s + (x.held_tokens || 0), 0);
-      b.vram_free_mib = m.engine?.vram_free_mib ?? 0;
-      b.cache = m.conversation_cache || null;
-    } catch (err) {
-      b.healthy = false;
-      b.lastError = String(err.message || err);
-    }
+async function pollOne(b) {
+  try {
+    const m = await getJson(b, '/metrics');
+    const live = m.live || {};
+    b.healthy = true;
+    b.lastError = null;
+    b.lastPoll = Date.now();
+    b.slots = live.slots || [];
+    b.running = live.running || 0;
+    b.queued = live.queued || 0;
+    b.batch = m.engine?.batch_slots ?? 2;
+    b.tok_s_mean = live.tok_s_mean ?? null;
+    b.held_tokens = b.slots.reduce((s, x) => s + (x.held_tokens || 0), 0);
+    b.vram_free_mib = m.engine?.vram_free_mib ?? 0;
+    b.cache = m.conversation_cache || null;
+  } catch (err) {
+    b.healthy = false;
+    b.lastError = String(err.message || err);
   }
+  wake();
+}
+
+// one loop per engine, so a dead one can't hold up the others' state
+async function pollLoop(b) {
+  for (;;) {
+    await sleep(config.pollMs);
+    await pollOne(b);
+  }
+}
+
+// requests waiting for a slot re-check whenever one frees up or a poll lands
+const waiters = new Set();
+
+function wake() {
+  for (const w of waiters) w();
+}
+
+function nextChange(ms) {
+  return new Promise((resolve) => {
+    const done = () => { clearTimeout(timer); waiters.delete(done); resolve(); };
+    const timer = setTimeout(done, Math.max(1, ms));
+    waiters.add(done);
+  });
 }
 
 // free slots we are allowed to use, minus the requests already in flight
@@ -117,199 +157,336 @@ function score(b) {
   return freeSlots(b) * (b.tok_s_mean || 60) - b.queued * 50 - b.inflight * 30;
 }
 
+const best = (list) => list.reduce((a, b) => (score(b) > score(a) ? b : a));
+
+function reserve(b) {
+  b.inflight++;
+  b.routed++;
+  return b;
+}
+
+function release(b) {
+  b.inflight--;
+  wake();
+}
+
 function textOf(content) {
   if (typeof content === 'string') return content;
-  if (Array.isArray(content)) return content.map((c) => (typeof c === 'string' ? c : c.text || '')).join(' ');
+  if (typeof content === 'number') return String(content);
+  if (Array.isArray(content)) return content.map((c) => textOf(c?.text ?? c)).filter(Boolean).join(' ');
   return '';
 }
 
 // fork-safe key: system + first user message, so a branch of a conversation
 // inherits the same home engine and reuses the prefix cache
 function conversationKey(body) {
-  const msgs = Array.isArray(body.messages) ? body.messages : [];
-  let system = '';
-  if (typeof body.system === 'string') system = body.system;
-  else if (typeof body.instructions === 'string') system = body.instructions;
-  else if (msgs[0] && ['system', 'developer'].includes(msgs[0].role)) system = textOf(msgs[0].content);
-
-  let first = '';
-  for (const m of msgs) {
-    if (m.role === 'user') { first = textOf(m.content); break; }
-  }
-  if (!first && Array.isArray(body.input)) first = textOf(body.input);
-  return `${body.model || 'default'}|${system}|${first.slice(0, 4000)}`;
+  const msgs = Array.isArray(body.messages) ? body.messages : Array.isArray(body.input) ? body.input : [];
+  let system = textOf(body.system) || textOf(body.instructions);
+  if (!system && ['system', 'developer'].includes(msgs[0]?.role)) system = textOf(msgs[0].content);
+  const first = textOf(msgs.find((m) => m?.role === 'user')?.content) || textOf(body.input) || textOf(body.prompt);
+  return createHash('sha256').update(`${body.model || 'default'}|${system}|${first.slice(0, 4000)}`).digest('hex').slice(0, 16);
 }
 
-async function pick(key) {
-  const owner = home.get(key);
-  const ownerB = config.backends.find((b) => b.name === owner);
-  if (ownerB && capacity(ownerB)) return ownerB;
+function remember(key, conv) {
+  convs.delete(key);
+  convs.set(key, conv);
+  while (convs.size > config.maxConversations) convs.delete(convs.keys().next().value);
+}
 
-  const open = config.backends.filter(capacity);
-  if (open.length) {
-    const chosen = open.sort((a, b) => score(b) - score(a))[0];
-    if (ownerB && chosen.name !== ownerB) stats.migrated++;
-    return chosen;
-  }
+// how long a busy home is worth waiting for: past this, a cold prefill elsewhere is cheaper
+function patience(conv, home) {
+  if (!home?.healthy) return 0;
+  return Math.min(config.queueWaitMs, (conv.prompt_tokens / config.prefillTokS) * 1000);
+}
 
-  // everything saturated: wait for a slot, then let the engine's own queue take it
-  const deadline = Date.now() + config.queueWaitMs;
-  while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 400));
-    const open = config.backends.filter(capacity);
-    if (open.length) {
-      stats.queued++;
-      return open.sort((a, b) => score(b) - score(a))[0];
+// resolves to a backend with a slot already reserved, or none when nothing can take the request
+async function pick(conv, isGone) {
+  const t0 = Date.now();
+  let waited = false;
+  for (;;) {
+    if (isGone()) return {};
+    const elapsed = Date.now() - t0;
+    const home = config.backends.find((b) => b.name === conv.backend);
+    if (home && capacity(home)) return { b: reserve(home), waited };
+
+    const healthy = config.backends.filter((b) => b.healthy);
+    if (!healthy.length && elapsed >= config.pollMs + 1000) return { waited };
+
+    const hold = patience(conv, home);
+    if (elapsed >= hold) {
+      const open = healthy.filter(capacity);
+      if (open.length) return { b: reserve(best(open)), waited };
     }
+    // everything saturated for too long: let an engine queue it, home first
+    if (healthy.length && elapsed >= config.queueWaitMs) {
+      return { b: reserve(home?.healthy ? home : best(healthy)), waited, overflow: true };
+    }
+    waited = true;
+    await nextChange(Math.min(1000, (elapsed < hold ? hold : config.queueWaitMs) - elapsed));
   }
-  stats.overflow++;
-  return config.backends.filter((b) => b.healthy).sort((a, b) => score(b) - score(a))[0] || null;
 }
 
-function usageFrom(body) {
-  const i = body.indexOf('"usage"');
-  if (i < 0) return null;
-  const j = body.indexOf('{', i);
-  if (j < 0) return null;
-  let depth = 0, end = -1;
-  for (let k = j; k < body.length; k++) {
-    if (body[k] === '{') depth++;
-    else if (body[k] === '}') { depth--; if (depth === 0) { end = k; break; } }
-  }
-  if (end < 0) return null;
-  try {
-    const u = JSON.parse(body.slice(j, end + 1));
-    u.cached = u.prompt_tokens_details?.cached_tokens ?? 0;
-    return u;
-  } catch (err) { return null; }
+// openai counts cache hits inside prompt_tokens, anthropic reports them beside input_tokens
+function normUsage(u) {
+  const cached = u.prompt_tokens_details?.cached_tokens ?? u.input_tokens_details?.cached_tokens ?? u.cache_read_input_tokens ?? 0;
+  const anthropic = 'cache_read_input_tokens' in u || 'cache_creation_input_tokens' in u;
+  const extra = anthropic ? (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0) : 0;
+  return {
+    prompt: u.prompt_tokens ?? (u.input_tokens || 0) + extra,
+    completion: u.completion_tokens ?? u.output_tokens ?? 0,
+    cached,
+  };
 }
 
-function forward(b, path, payload, res) {
-  return new Promise((resolve) => {
-    const t0 = Date.now();
-    let firstByte = false;
-    let body = '';
-
-    const req = http.request(
-      {
-        host: b.host,
-        port: b.port,
-        path,
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'content-length': Buffer.byteLength(payload),
-          accept: 'application/json',
-        },
-        timeout: config.readTimeoutMs,
-      },
-      (ur) => {
-        if (ur.statusCode >= 500 && !firstByte) {
-          ur.resume();
-          resolve({ ok: false, error: `upstream ${ur.statusCode}`, elapsed: Date.now() - t0 });
-          return;
-        }
-        res.writeHead(ur.statusCode, {
-          'content-type': ur.headers['content-type'] || 'application/json',
-          'x-strata-backend': b.name,
-        });
-        ur.on('data', (chunk) => {
-          firstByte = true;
-          res.write(chunk);
-          if (body.length < 1_000_000) body += chunk.toString();
-        });
-        ur.on('end', () => { res.end(); resolve({ ok: true, elapsed: Date.now() - t0, usage: usageFrom(body) }); });
-        ur.on('error', (err) => {
-          if (!firstByte) resolve({ ok: false, error: String(err.message || err), elapsed: Date.now() - t0 });
-          else res.end();
-        });
+function usageTap(sse) {
+  const dec = new StringDecoder('utf8');
+  let buf = '';
+  let size = 0;
+  let usage = null;
+  const take = (o) => {
+    for (const u of [o?.usage, o?.message?.usage, o?.response?.usage]) {
+      if (u && typeof u === 'object') usage = { ...usage, ...u };
+    }
+  };
+  const line = (l) => {
+    const data = l.startsWith('data:') ? l.slice(5).trim() : '';
+    if (!data || data === '[DONE]') return;
+    try { take(JSON.parse(data)); } catch {}
+  };
+  return {
+    write(chunk) {
+      size += chunk.length;
+      if (!sse) {
+        if (size <= MAX_BODY) buf += dec.write(chunk);
+        return;
       }
-    );
-    req.on('error', (err) => resolve({ ok: false, error: String(err.message || err), elapsed: Date.now() - t0 }));
-    req.on('timeout', () => req.destroy(new Error('read timeout')));
-    req.write(payload);
-    req.end();
+      buf += dec.write(chunk);
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        line(buf.slice(0, i));
+        buf = buf.slice(i + 1);
+      }
+      if (buf.length > 1_000_000) buf = '';
+    },
+    end() {
+      if (sse) line(buf + dec.end());
+      else if (size <= MAX_BODY) {
+        try { take(JSON.parse(buf + dec.end())); } catch {}
+      }
+      return usage && normUsage(usage);
+    },
+  };
+}
+
+function passHeaders(headers, b) {
+  const out = {};
+  for (const [k, v] of Object.entries(headers)) if (!HOP.has(k)) out[k] = v;
+  out['x-strata-backend'] = b.name;
+  return out;
+}
+
+// retryable means nothing reached the client yet; hold5xx buffers an engine 5xx instead of relaying it
+function forward(b, req, url, payload, res, hold5xx = false) {
+  return new Promise((resolve) => {
+    if (res.destroyed) return resolve({ ok: false, retryable: false, aborted: true, error: 'client went away', elapsed: 0 });
+    const t0 = Date.now();
+    let settled = false;
+    let connected = false;
+    let gone = false;
+    let connectTimer;
+
+    const done = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(connectTimer);
+      res.off('close', onClientClose);
+      resolve({ elapsed: Date.now() - t0, ...result });
+    };
+    const fail = (err) => {
+      if (settled) return;
+      const error = String(err?.message || err);
+      if (!connected && !gone) {
+        b.healthy = false;
+        b.lastError = error;
+      }
+      // a half-sent answer has to look broken to the client, not complete
+      if (res.headersSent && !res.writableEnded) res.destroy();
+      done({ ok: false, retryable: !res.headersSent && !gone, aborted: gone, error });
+    };
+    const onClientClose = () => {
+      if (res.writableFinished) return;
+      gone = true;
+      up.destroy(new Error('client went away'));
+    };
+
+    const headers = { accept: req.headers.accept || 'application/json' };
+    if (payload) {
+      headers['content-type'] = req.headers['content-type'] || 'application/json';
+      headers['content-length'] = payload.length;
+    }
+
+    const up = http.request({ host: b.host, port: b.port, path: url, method: req.method, headers, agent, timeout: config.readTimeoutMs }, (r) => {
+      r.on('error', fail);
+      if (hold5xx && r.statusCode >= 500) {
+        const chunks = [];
+        r.on('data', (c) => chunks.push(c));
+        r.on('end', () => done({ ok: false, retryable: !gone, error: `upstream ${r.statusCode}`, status: r.statusCode, headers: r.headers, body: Buffer.concat(chunks) }));
+        return;
+      }
+      try {
+        res.writeHead(r.statusCode, passHeaders(r.headers, b));
+      } catch (err) {
+        r.resume();
+        return fail(err);
+      }
+      const tap = usageTap(/event-stream/.test(r.headers['content-type'] || ''));
+      r.on('data', (c) => {
+        res.write(c);
+        tap.write(c);
+      });
+      r.on('end', () => {
+        res.end();
+        done({ ok: true, status: r.statusCode, usage: tap.end() });
+      });
+    });
+    up.on('socket', (s) => {
+      if (settled || !s.connecting) {
+        connected = true;
+        return;
+      }
+      connectTimer = setTimeout(() => up.destroy(new Error('connect timeout')), config.connectTimeoutMs);
+      s.once('connect', () => {
+        connected = true;
+        clearTimeout(connectTimer);
+      });
+    });
+    up.on('timeout', () => up.destroy(new Error('read timeout')));
+    up.on('error', fail);
+    up.on('close', () => { if (!up.res?.complete) fail(new Error('engine closed the connection')); });
+    res.on('close', onClientClose);
+    up.end(payload || undefined);
   });
 }
 
-async function handleChat(path, raw, res) {
-  let parsed;
-  try { parsed = JSON.parse(raw); } catch (err) {
-    res.writeHead(400, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ error: 'invalid json' }));
+function send(res, status, obj) {
+  res.writeHead(status, { 'content-type': 'application/json' });
+  res.end(JSON.stringify(obj));
+}
+
+function readBody(req, res, cb) {
+  const chunks = [];
+  let size = 0;
+  req.on('data', (c) => {
+    if ((size += c.length) > MAX_BODY) {
+      if (!res.headersSent) send(res, 413, { error: 'payload too large' });
+      req.destroy();
+    } else chunks.push(c);
+  });
+  req.on('end', () => cb(Buffer.concat(chunks)));
+}
+
+async function handleChat(req, res, raw) {
+  let body;
+  try {
+    body = JSON.parse(raw.toString('utf8'));
+  } catch {
+    return send(res, 400, { error: 'invalid json' });
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return send(res, 400, { error: 'expected a json object' });
+
+  const key = conversationKey(body);
+  let conv = convs.get(key);
+  if (!conv) {
+    conv = { backend: null, turns: 0, prompt_tokens: 0, first: new Date().toISOString(), model: body.model };
+    stats.cold++;
+  }
+  conv.turns++;
+  remember(key, conv);
+
+  let gone = false;
+  res.on('close', () => {
+    if (res.writableFinished) return;
+    gone = true;
+    wake();
+  });
+
+  const picked = await pick(conv, () => gone || res.destroyed);
+  if (!picked.b) {
+    if (!gone) {
+      send(res, 503, {
+        error: 'no healthy backend',
+        backends: config.backends.map((x) => ({ name: x.name, healthy: x.healthy, error: x.lastError })),
+      });
+    }
     return;
   }
-
-  const key = conversationKey(parsed);
-  const m = meta.get(key) || { turns: 0, first: new Date().toISOString(), model: parsed.model };
-  if (!meta.has(key)) { stats.cold++; }
-  m.turns++;
-  meta.set(key, m);
-  if (meta.size > config.maxConversations) {
-    const oldest = meta.keys().next().value;
-    meta.delete(oldest);
-    home.delete(oldest);
-  }
-
-  const b = await pick(key);
-  if (!b) {
-    res.writeHead(503, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({
-      error: 'no healthy backend',
-      backends: config.backends.map((x) => ({ name: x.name, healthy: x.healthy, error: x.lastError })),
-    }));
-    return;
-  }
-
-  home.set(key, b.name);
-  b.inflight++;
   stats.requests++;
-  b.routed++;
+  if (picked.waited) stats.queued++;
+  if (picked.overflow) stats.overflow++;
 
-  let out = await forward(b, path, raw, res);
-  if (!out.ok) {
-    stats.errors++;
-    log(`fail ${b.name} ${out.error} (${out.elapsed}ms)`);
-    const alt = config.backends.find((x) => x.name !== b.name && x.healthy && capacity(x));
-    if (alt) {
-      alt.inflight++;
-      alt.routed++;
-      home.set(key, alt.name);
-      stats.migrated++;
-      out = await forward(alt, path, raw, res);
-      if (out.ok) log(`re-routed ${b.name} -> ${alt.name} ${out.elapsed}ms`);
-      alt.inflight--;
+  const attempt = async (b, hold5xx) => {
+    let out;
+    try {
+      out = await forward(b, req, req.url, raw, res, hold5xx);
+    } finally {
+      release(b);
+    }
+    if (!out.ok && !out.aborted) {
+      stats.errors++;
+      log(`fail ${b.name} ${out.error} (${out.elapsed}ms)`);
+    }
+    return out;
+  };
+
+  let served = picked.b;
+  let out = await attempt(served, true);
+  if (!out.ok && out.retryable) {
+    const open = config.backends.filter((x) => x !== served && capacity(x));
+    if (open.length) {
+      stats.retried++;
+      served = reserve(best(open));
+      out = await attempt(served, false);
     }
   }
 
-  b.inflight--;
+  // the engine took the prompt, so that's where its KV lives now
+  if (out.ok ? out.status < 400 : res.headersSent) {
+    if (conv.backend && conv.backend !== served.name) stats.migrated++;
+    conv.backend = served.name;
+  }
 
   if (out.ok) {
-    const u = out.usage || {};
-    stats.prompt_tokens += u.prompt_tokens || 0;
-    stats.completion_tokens += u.completion_tokens || 0;
-    stats.cached_tokens += u.cached || 0;
-    log(`${b.name} key=${key.slice(0, 16)} turns=${m.turns} prompt=${u.prompt_tokens ?? '-'} cached=${u.cached ?? 0} out=${u.completion_tokens ?? '-'} ${out.elapsed}ms`);
-  } else {
-    log(`error ${b.name} ${out.error}`);
-    if (!res.headersSent) {
-      res.writeHead(502, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: out.error, backend: b.name }));
+    const u = out.usage;
+    if (u) {
+      stats.prompt_tokens += u.prompt;
+      stats.completion_tokens += u.completion;
+      stats.cached_tokens += u.cached;
+      conv.prompt_tokens = u.prompt;
+    }
+    const status = out.status === 200 ? '' : ` status=${out.status}`;
+    log(`${served.name} key=${key} turns=${conv.turns}${status} prompt=${u?.prompt ?? '-'} cached=${u?.cached ?? '-'} out=${u?.completion ?? '-'} ${out.elapsed}ms`);
+  } else if (out.aborted) {
+    log(`gone ${served.name} key=${key} after ${out.elapsed}ms`);
+  } else if (!res.headersSent) {
+    if (out.status) {
+      res.writeHead(out.status, passHeaders(out.headers, served));
+      res.end(out.body);
+    } else {
+      send(res, 502, { error: out.error, backend: served.name });
     }
   }
 }
 
+async function relay(req, res, url, raw) {
+  const b = config.backends.find((x) => x.healthy);
+  if (!b) return send(res, 503, { error: 'no healthy backend' });
+  const out = await forward(b, req, url, req.method === 'GET' ? null : raw, res);
+  if (!out.ok && !out.aborted && !res.headersSent) send(res, 502, { error: out.error, backend: b.name });
+}
+
 function handleGet(res, path) {
-  if (path === '/' || path === '/health') {    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({
-      ok: config.backends.some((b) => b.healthy),
-      backends: config.backends.map((b) => ({ name: b.name, host: `${b.host}:${b.port}`, healthy: b.healthy, inflight: b.inflight, queued: b.queued, running: b.running })),
-    }));
-    return;
-  }
   if (path === '/stats') {
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({
+    return send(res, 200, {
       stats,
       backends: config.backends.map((b) => ({
         name: b.name,
@@ -329,87 +506,71 @@ function handleGet(res, path) {
         requests: b.cache?.requests ?? 0,
         lastError: b.lastError,
       })),
-      conversations: [...home.entries()].slice(-50).map(([k, v]) => ({ key: k.slice(0, 16), backend: v, turns: meta.get(k)?.turns ?? 0 })),
-    }));
-    return;
+      conversations: [...convs].slice(-50).map(([key, c]) => ({ key, backend: c.backend, turns: c.turns, prompt_tokens: c.prompt_tokens })),
+    });
   }
-  if (path === '/v1/models' || path === '/models') {
-    const b = config.backends.find((x) => x.healthy) || config.backends[0];
-    getJson(b, '/v1/models', config.connectTimeoutMs)
-      .then((m) => {
-        res.writeHead(200, { 'content-type': 'application/json', 'x-strata-backend': b.name });
-        res.end(JSON.stringify(m));
-      })
-      .catch((err) => {
-        res.writeHead(503, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: String(err.message || err), backend: b.name }));
-      });
-    return;
-  }
-
-  res.writeHead(404, { 'content-type': 'application/json' });
-  res.end(JSON.stringify({ error: 'not found' }));
+  send(res, 200, {
+    ok: config.backends.some((b) => b.healthy),
+    backends: config.backends.map((b) => ({ name: b.name, host: `${b.host}:${b.port}`, healthy: b.healthy, inflight: b.inflight, queued: b.queued, running: b.running })),
+  });
 }
 
-const CHAT_PATHS = new Set(['/v1/chat/completions', '/v1/messages', '/v1/responses']);
-const KNOWN = new Set(['/', '/health', '/stats', '/v1/models', '/models']);
+function loadState() {
+  if (!config.stateFile) return;
+  try {
+    const names = new Set(config.backends.map((b) => b.name));
+    for (const [key, c] of JSON.parse(fs.readFileSync(config.stateFile, 'utf8'))) {
+      if (names.has(c?.backend)) remember(key, { backend: c.backend, turns: c.turns || 0, prompt_tokens: c.prompt_tokens || 0, first: c.first, model: c.model });
+    }
+    log(`restored ${convs.size} conversation homes from ${config.stateFile}`);
+  } catch (err) {
+    if (err.code !== 'ENOENT') console.error(`state file ${config.stateFile}: ${err.message}`);
+  }
+}
+
+function saveState() {
+  if (!config.stateFile) return;
+  try {
+    fs.writeFileSync(`${config.stateFile}.tmp`, JSON.stringify([...convs]));
+    fs.renameSync(`${config.stateFile}.tmp`, config.stateFile);
+  } catch (err) {
+    console.error(`state file ${config.stateFile}: ${err.message}`);
+  }
+}
 
 const server = http.createServer((req, res) => {
-  const path = req.url || '/';
+  const path = (req.url || '/').split('?')[0];
+  if (req.method === 'GET' && LOCAL.has(path)) return handleGet(res, path);
 
-  if (req.method === 'POST' && CHAT_PATHS.has(path)) {
-    let raw = '';
-    req.on('data', (c) => { raw += c; if (raw.length > 20_000_000) { res.writeHead(413); res.end('payload too large'); req.destroy(); } });
-    req.on('end', () => handleChat(path, raw, res));
-    return;
+  const routed = req.method === 'POST' && ROUTED.has(path);
+  if (!routed && req.method !== 'GET') {
+    if (req.method !== 'POST' || LOCAL.has(path)) return send(res, 405, { error: 'method not allowed' });
+    if (config.passthrough.size && !config.passthrough.has(path)) return send(res, 404, { error: 'not forwarded (see PASSTHROUGH)' });
   }
 
-  if (req.method === 'GET') {
-    if (KNOWN.has(path)) { handleGet(res, path); return; }
-    // engine introspection (/metrics, /status, /slots) proxied to the first healthy engine
-    const b = config.backends.find((x) => x.healthy);
-    if (!b) {
-      res.writeHead(503, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: 'no healthy backend' }));
-      return;
-    }
-    getJson(b, path, config.connectTimeoutMs)
-      .then((m) => {
-        res.writeHead(200, { 'content-type': 'application/json', 'x-strata-backend': b.name });
-        res.end(JSON.stringify(m));
-      })
-      .catch((err) => {
-        res.writeHead(502, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: String(err.message || err), backend: b.name }));
-      });
-    return;
-  }
-
-  // anything else the engine exposes (/v1/vram, /slots, /status, ...) proxied to the first healthy engine
-  if (req.method === 'POST' && !KNOWN.has(path)) {
-    const b = config.backends.find((x) => x.healthy);
-    if (!b) {
-      res.writeHead(503, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: 'no healthy backend' }));
-      return;
-    }
-    let raw = '';
-    req.on('data', (c) => (raw += c));
-    req.on('end', () => forward(b, path, raw, res));
-    return;
-  }
-
-  res.writeHead(405, { 'content-type': 'application/json' });
-  res.end(JSON.stringify({ error: 'method not allowed' }));
+  readBody(req, res, (raw) => {
+    const work = routed ? handleChat(req, res, raw) : relay(req, res, path === '/models' ? '/v1/models' : req.url, raw);
+    work.catch((err) => {
+      console.error('strata-router: unexpected error', err);
+      if (!res.headersSent) send(res, 500, { error: 'internal error' });
+      else res.destroy();
+    });
+  });
 });
 
-poll();
-setInterval(poll, config.pollMs);
+loadState();
+await Promise.all(config.backends.map(pollOne));
+for (const b of config.backends) pollLoop(b);
+if (config.stateFile) setInterval(saveState, 60_000).unref();
+
 server.listen(config.port, process.env.BIND || '0.0.0.0', () => {
   log(`strata-router on :${config.port} -> ${config.backends.map((b) => `${b.name}=${b.host}:${b.port}`).join(', ')}`);
 });
 
-process.on('SIGTERM', () => {
+function shutdown() {
+  saveState();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 3000);
-});
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
