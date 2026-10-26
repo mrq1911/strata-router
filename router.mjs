@@ -315,6 +315,7 @@ async function pollLoop(b) {
 
 // requests waiting for a slot, in arrival order; claim is the busy home a patient one holds out for
 const queue = new Set();
+const shortWaiting = new Set();
 
 // whoever is woken first takes a freed slot: short requests, and anyone past SHORT_PASS_MS, before the rest
 function wake() {
@@ -424,6 +425,15 @@ async function pick(conv, isGone, exclude = null, short = false) {
       // a retry has nowhere to go; otherwise give the next poll a chance before failing
       if (!healthy.length && (exclude || performance.now() - lastHealthyAt >= Math.min(config.queueWaitMs, config.pollMs + 1000))) return { waited };
 
+      // a short request waiting behind long ones takes the next freed slot, as long as it does not
+      // starve: a long request only steps aside for SHORT_PASS_MS, then arrival order rules again
+      if (!me.short && elapsed < SHORT_PASS_MS && shortWaiting.size) {
+        waited = true;
+        queue.add(me);
+        await sleep(200);
+        continue;
+      }
+
       const hold = patience(conv, home);
       me.claim = elapsed < hold ? home : null;
       if (!me.claim) {
@@ -437,6 +447,7 @@ async function pick(conv, isGone, exclude = null, short = false) {
       }
       waited = true;
       queue.add(me);
+      if (me.short) shortWaiting.add(me);
       await new Promise((resolve) => {
         const timer = setTimeout(resolve, Math.max(1, Math.min(1000, (me.claim ? hold : config.queueWaitMs) - elapsed)));
         me.wake = () => {
@@ -446,6 +457,7 @@ async function pick(conv, isGone, exclude = null, short = false) {
       });
     }
   } finally {
+    shortWaiting.delete(me);
     // a claim going away can open its slot to the others
     if (queue.delete(me) && me.claim) wake();
   }
