@@ -59,6 +59,9 @@ a bad value stops the router at startup with a message naming it, rather than ro
 | `POST /v1/responses` | same routing (OpenAI Responses-style) |
 | `GET /health` | backend health, in-flight, queued |
 | `GET /stats` | counters, per-engine state, conversation homes |
+| `GET /dashboard` | live dashboard of engines, conversation homes and routing decisions (see [dashboard](#dashboard)) |
+| `GET /stats/events?since=<id>` | routing decisions after event `id` (the last 200 are kept), and the requests still waiting or running |
+| `GET /stats/conversations` | every tracked conversation, not just the last 50 |
 | `GET /v1/models` (and `/models`) | proxied from the first healthy engine (pi's model list needs this to show a provider as running) |
 | any other `GET` (`/metrics`, `/status`, `/slots`, ...) | proxied to the first healthy engine, status and body as the engine sent them |
 | `POST` to any other engine path (`/v1/vram`, `SAVE` sessions, ...) | proxied to the first healthy engine; set `PASSTHROUGH` to whitelist paths, since the router listens on all interfaces without auth |
@@ -104,6 +107,10 @@ a bad value stops the router at startup with a message naming it, rather than ro
 - `tok_s_mean` — rolling decode speed used for the load score
 - `prefill_tok_s` — measured cold prefill speed (empty until a long enough streamed turn ran there)
 - `poll_fails` — failed polls in a row
+- `capacity` — slots the router fills, the smaller of `MAX_INFLIGHT` and the batch slots; `inflight` passes it after an
+  overflow
+- `claimed` — conversations holding out for this engine as their busy home
+- `conversations` — conversations whose home it is
 
 and globally: `cold` (new conversations, i.e. prefills), `migrated` (conversations whose home moved), `queued`
 (requests that waited for a slot), `waiting` (waiting right now), `overflow` (handed to a full engine after
@@ -111,6 +118,28 @@ and globally: `cold` (new conversations, i.e. prefills), `migrated` (conversatio
 `cached_tokens / prompt_tokens` — the ratio you should actually watch. Usage is read from JSON and SSE answers in
 chat, messages and responses shapes. A healthy setup has almost as many cold events as conversations, not as
 many as turns.
+
+each conversation also carries `last_seen` (ms since the epoch) and `migrations` (how often its home moved).
+
+## dashboard
+
+open `http://localhost:8000/dashboard`. it is part of `router.mjs`, polls the router every 1.5 s and loads nothing
+from anywhere else, so it works offline. it shows
+
+- the cache hit ratio and the requests waiting for a slot right now, above the router's counters
+- one card per engine: health, slots in use, its own queue, decode and prefill speed, its conversation cache, and
+  the conversations whose home it is, with turns, prompt size, last seen and how often each moved
+- routing decisions as they finish, newest first, under the requests still waiting or running; hovering a row
+  highlights that conversation everywhere on the page
+
+each decision gets one kind, first match wins: `gone` (the client hung up), `failed`, `retry` (an engine failed
+before answering), `overflow`, `spill` (the home moved), `queued` (waited for a slot), `cold` (new conversation),
+`sticky`. when the router stops answering, the page says so and dims the last data it had.
+
+`GET /stats/events` gives each decision as `kind`, `key`, `turn`, `home` (where the conversation lived before),
+`backend`, `wait_ms`, `retry_from`/`retry_error`, `status`/`error`, token counts, `arrived` (ms since the epoch),
+`ttft_ms` (streamed answers only) and `ms`, the last two counted from arrival. Like `/stats`, the dashboard data
+carries conversation key hashes, never prompt text.
 
 ## systemd
 

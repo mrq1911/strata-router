@@ -688,6 +688,67 @@ await scenario('strata state', async () => {
   check('an engine without batch slots takes one request at a time', waited === 1, `${waited} waited for the slot`);
 });
 
+await scenario('dashboard and events', async () => {
+  const A = await engine('A', 20);
+  const B = await engine('B', 20);
+  const r = await router([A, B], { PREFILL_TOK_S: '20000' });
+
+  const page = await fetch(`${r.url}/dashboard`);
+  const html = await page.text();
+  check('/dashboard serves a self-contained html page', page.status === 200 && /^text\/html/.test(page.headers.get('content-type')) && html.startsWith('<!doctype html>') && !/https?:\/\//.test(html), `${page.status} ${page.headers.get('content-type')}, ${html.length} bytes`);
+
+  const t0 = Date.now();
+  const first = await chat(r, turns('route me', 0));
+  await chat(r, turns('route me', 1));
+  const [home, other] = first.backend === 'A' ? [A, B] : [B, A];
+  home.queued = 1;
+  await sleep(300);
+  await chat(r, turns('route me', 2));
+  home.queued = 0;
+  await sleep(300);
+  other.mode = '500';
+  await chat(r, turns('route me', 3));
+  other.mode = 'ok';
+  const { events, last } = await get(r, '/stats/events');
+  const [, sticky, spill, retry] = events;
+  check('events: a new conversation, a sticky turn, a spill and a retry', events.map((e) => e.kind).join() === 'cold,sticky,spill,retry', events.map((e) => e.kind).join());
+  check('events: a spill names the old home, a retry the engine that failed', spill?.home === home.name && spill.backend === other.name && spill.queued && retry?.retry_from === other.name && retry.retry_error === 'upstream 500' && retry.backend === home.name, JSON.stringify({ spill, retry }));
+  check('events: tokens and times, but no prompt text', sticky?.prompt_tokens === 1000 && sticky.cached_tokens === 600 && sticky.completion_tokens === 10 && sticky.arrived >= t0 && sticky.ms >= 0 && !JSON.stringify(events).includes('route me'), JSON.stringify(sticky));
+
+  const newer = await get(r, `/stats/events?since=${events[1].id}`);
+  const restarted = await get(r, `/stats/events?since=${last + 100}`);
+  check('/stats/events?since= sends only newer events, all of them to a cursor from before a restart', newer.events.map((e) => e.kind).join() === 'spill,retry' && restarted.events.length === events.length, `${newer.events.length} newer, ${restarted.events.length} for a stale cursor`);
+
+  const { conversations } = await get(r, '/stats/conversations');
+  const conv = conversations.find((c) => c.turns === 4);
+  check('conversations carry their last-seen time and migration count', conv?.backend === home.name && conv.migrations === 2 && conv.last_seen >= t0 && conv.last_seen <= Date.now(), JSON.stringify(conv));
+  const st = await get(r, '/stats');
+  check('/stats adds conversation and engine fields', st.conversations[0].migrations === 2 && st.conversations[0].last_seen === conv.last_seen && st.backends.every((b) => b.capacity === 2 && b.claimed === 0) && st.backends.find((b) => b.name === home.name).conversations === 1, JSON.stringify(st.backends.map(({ name, capacity, claimed, conversations: n }) => ({ name, capacity, claimed, n }))));
+
+  A.mode = B.mode = '500';
+  await chat(r, turns('nobody answers', 0));
+  A.mode = B.mode = 'ok';
+  const pending = chat(r, turns('in flight', 0), { latency_ms: 800 });
+  await sleep(200);
+  const during = (await get(r, '/stats/events')).live;
+  await pending;
+  A.mode = B.mode = 'slow';
+  const ac = new AbortController();
+  const res = await post(r, '/v1/chat/completions', { model: 'fake', stream: true, messages: [{ role: 'user', content: 'leaving early' }] }, { signal: ac.signal });
+  await res.body.getReader().read();
+  ac.abort();
+  await sleep(300);
+  A.mode = B.mode = 'ok';
+  const tail = (await get(r, '/stats/events')).events.slice(-3);
+  check('events: failed with its status, in flight under live, client gone', tail.map((e) => e.kind).join() === 'failed,cold,gone' && tail[0].status === 500 && tail[0].retry_from && during.length === 1 && during[0].backend && during[0].key === tail[1].key, JSON.stringify({ tail: tail.map((e) => [e.kind, e.status, e.error]), during }));
+
+  const Z = await engine('Z', 0);
+  const rz = await router([Z]);
+  for (let i = 0; i < 205; i++) await chat(rz, turns('ring', 0));
+  const ring = await get(rz, '/stats/events');
+  check('events keep only the last 200', ring.events.length === 200 && ring.last === 205 && ring.events[0].id === 6, `${ring.events.length} kept, ids ${ring.events[0]?.id}..${ring.last}`);
+});
+
 for (const child of routers) child.kill('SIGKILL');
 for (const e of engines) {
   e.server.closeAllConnections();
