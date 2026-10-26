@@ -97,9 +97,46 @@ node test/mock-engines.mjs   # two fake engines
 node test/test.mjs           # stickiness, spill, failover, queueing
 ```
 
+## pointing a client at it
+
+pi (`~/.pi/agent/models.json`):
+
+```json
+{
+  "providers": {
+    "strata": {
+      "name": "Strata router",
+      "baseUrl": "http://localhost:8000/v1",
+      "api": "openai-completions",
+      "apiKey": "local",
+      "compat": { "supportsDeveloperRole": false },
+      "models": [
+        {
+          "id": "qwen3.8-flash-next-q2_0",
+          "name": "Qwen3.8-Flash-Next Q2_0 (router)",
+          "reasoning": true,
+          "contextWindow": 262144,
+          "maxTokens": 32768,
+          "compat": { "thinkingFormat": "chat-template" }
+        }
+      ]
+    }
+  }
+}
+```
+
+and in `settings.json`: `"defaultProvider": "strata"`, plus a per-model thinking level if the engine
+supports the chat-template thinking flags. opencode uses the same idea with
+`"npm": "@ai-sdk/openai-compatible"` and `"options": { "baseURL": "http://localhost:8000/v1" }`.
+
+keep the direct engine endpoints as a second provider so you can A/B a conversation against the router.
+
 ## notes on engine configuration
 
 - set `MAX_INFLIGHT` equal to the engine's `--batch` value, otherwise the router under- or over-fills it
 - conversation parking (`--conversation-cache-mib 32768 --conversation-cache-slots 8`) is what makes spill and
   restore cheap; without it an evicted conversation must be fully re-prefilled
 - parking lives in host RAM: a parked 262k conversation is roughly 5 GB at int8, live KV is ~13.7 KB/token
+- thinking consumes the output budget: with reasoning on and a small `max_tokens` the engine can spend the whole
+  budget on reasoning and return no answer (`the reply reached max tokens while still thinking`). Give agent calls
+  a generous `max_tokens` or set `reasoning_budget_tokens`
