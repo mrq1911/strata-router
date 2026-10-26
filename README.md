@@ -154,7 +154,8 @@ each conversation also carries `last_seen` (ms since the epoch) and `migrations`
 ## dashboard
 
 open `http://localhost:8000/dashboard`. it is part of `router.mjs`, polls the router every 1.5 s and loads nothing
-from anywhere else, so it works offline. it shows
+from anywhere else, so it works offline. its icon (`/favicon.ico`, an svg) is a conversation with two engines, the
+filled one its home. it shows
 
 - the cache hit ratio, time to first token, requests waiting for a slot and throughput, with their recent trend,
   above the router's counters
