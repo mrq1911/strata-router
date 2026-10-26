@@ -749,6 +749,22 @@ await scenario('dashboard and events', async () => {
   check('events keep only the last 200', ring.events.length === 200 && ring.last === 205 && ring.events[0].id === 6, `${ring.events.length} kept, ids ${ring.events[0]?.id}..${ring.last}`);
 });
 
+await scenario('claim hold', async () => {
+  const A = await engine('A', 20);
+  const r = await router([A], { MAX_INFLIGHT: '1', POLL_MS: '60000', PREFILL_TOK_S: '100' });
+  for (const p of ['P1', 'P2', 'P3', 'P4']) await chat(r, turns(p, 0));
+  const pending = [chat(r, turns('L', 0), { latency_ms: 1500 })];
+  await sleep(50);
+  pending.push(chat(r, turns('N', 0)));
+  for (const p of ['P1', 'P2', 'P3', 'P4']) {
+    await sleep(50);
+    pending.push(chat(r, turns(p, 1), { latency_ms: 900 }));
+  }
+  await Promise.all(pending);
+  const order = A.log.slice(4).map((x) => x.first);
+  check('a newcomer waits out claims for at most CLAIM_HOLD_MS, then takes its turn', order.indexOf('N') < order.indexOf('P3'), order.join(','));
+});
+
 for (const child of routers) child.kill('SIGKILL');
 for (const e of engines) {
   e.server.closeAllConnections();

@@ -77,7 +77,8 @@ a bad value stops the router at startup with a message naming it, rather than ro
   connect marks it down at once.
 - **patient** when the home is busy: wait for its slot as long as a cold prefill of the conversation would take
   elsewhere (last turn's prompt tokens ÷ the fastest other engine's prefill speed, capped at `MAX_QUEUE_WAIT`),
-  and hold the home's next free slot against newcomers meanwhile. Prefill speed is measured per engine from
+  and hold the home's next free slot against newcomers meanwhile (for at most 2 s of a newcomer's wait, so short
+  side requests can't starve behind it). Prefill speed is measured per engine from
   streamed turns with at least 1,000 uncached prompt tokens, starting from `PREFILL_TOK_S`; without usage in the
   answers, the prompt size is estimated from the request. New conversations don't wait.
 - **spill** to the least-loaded engine with a free slot after that, or right away when the home is down; the home

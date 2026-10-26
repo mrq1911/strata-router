@@ -121,6 +121,7 @@ const HOP = new Set(['connection', 'keep-alive', 'transfer-encoding', 'te', 'tra
 // expect would stall the upstream request; accept-encoding would compress answers the router has to read
 const NOT_FORWARDED = new Set(['host', 'content-length', 'expect', 'accept-encoding']);
 const MAX_BODY = 20_000_000;
+const CLAIM_HOLD_MS = 2000;
 // a fresh connection per request, so a stale keep-alive socket can't fail (and spill) a turn
 const agent = new http.Agent({ keepAlive: false });
 
@@ -313,7 +314,8 @@ async function pick(conv, isGone, exclude = null) {
       const hold = patience(conv, home);
       me.claim = elapsed < hold ? home : null;
       if (!me.claim) {
-        const open = healthy.filter((b) => capacity(b) && freeSlots(b) > claimed(b));
+        // claims shield a waiting conversation's home from newcomers, but only briefly: past that, arrival order
+        const open = healthy.filter((b) => capacity(b) && (elapsed >= CLAIM_HOLD_MS || freeSlots(b) > claimed(b)));
         if (open.length) return { b: reserve(best(open)), waited };
       }
       // everything saturated for too long: let an engine queue it, home first
