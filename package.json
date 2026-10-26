@@ -1,0 +1,13 @@
+{
+  "name": "strata-router",
+  "version": "0.1.0",
+  "description": "conversation-sticky router in front of several Strata inference engines",
+  "type": "module",
+  "bin": { "strata-router": "router.mjs" },
+  "engines": { "node": ">=20" },
+  "license": "MIT",
+  "scripts": {
+    "start": "node router.mjs",
+    "test": "node test/test.mjs"
+  }
+}

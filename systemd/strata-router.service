@@ -1,0 +1,16 @@
+[Unit]
+Description=Strata router: conversation-sticky routing across Strata engines
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node /opt/strata-router/router.mjs
+Environment=STRATA_BACKENDS=a=127.0.0.1:8080,b=127.0.0.1:8081
+Environment=PORT=8000
+Environment=POLL_MS=2000
+Environment=MAX_INFLIGHT=2
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
