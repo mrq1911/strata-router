@@ -29,6 +29,7 @@ const config = {
   shutdownGraceMs: num('SHUTDOWN_GRACE', 30000),
   passthrough: new Set((process.env.PASSTHROUGH || '').split(',').map((s) => s.trim()).filter(Boolean)),
   stateFile: process.env.STATE_FILE || '',
+  apiKey: readKey(process.env.STRATA_API_KEY_FILE),
   verbose: process.env.LOG !== 'off',
 };
 
@@ -55,6 +56,19 @@ function num(name, fallback, { min = 0, max = 2 ** 31 - 1, integer = true } = {}
   return fallback;
 }
 
+// strata wants its api key on /metrics too; clients still send their own on requests
+function readKey(file) {
+  if (!file) return '';
+  try {
+    const key = fs.readFileSync(file, 'utf8').trim();
+    if (key) return key;
+    problems.push(`STRATA_API_KEY_FILE=${file}: the file is empty`);
+  } catch (err) {
+    problems.push(`STRATA_API_KEY_FILE=${file}: ${err.code || err.message}`);
+  }
+  return '';
+}
+
 function parseBackends(spec) {
   const entries = spec.split(',').map((s) => s.trim()).filter(Boolean);
   if (!entries.length) problems.push('STRATA_BACKENDS: no engines configured');
@@ -74,6 +88,7 @@ function parseBackends(spec) {
       port,
       healthy: false,
       fails: 0,
+      state: null,
       slots: [],
       running: 0,
       queued: 0,
@@ -129,11 +144,13 @@ const errText = (err) => String(err?.message || err?.code || err);
 
 function getJson(b, path, timeout = 5000) {
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: b.host, port: b.port, path, method: 'GET', timeout, agent }, (res) => {
+    const headers = config.apiKey ? { authorization: `Bearer ${config.apiKey}` } : {};
+    const req = http.request({ host: b.host, port: b.port, path, method: 'GET', headers, timeout, agent }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => {
-        if (res.statusCode !== 200) return reject(Object.assign(new Error(`${path} answered ${res.statusCode}`), { definite: true }));
+        const hint = res.statusCode === 401 ? (config.apiKey ? ' (wrong API key?)' : ' (the engine wants an API key: STRATA_API_KEY_FILE)') : '';
+        if (res.statusCode !== 200) return reject(Object.assign(new Error(`${path} answered ${res.statusCode}${hint}`), { definite: true }));
         try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); } catch (err) { reject(err); }
       });
       res.on('error', reject);
@@ -147,7 +164,8 @@ function getJson(b, path, timeout = 5000) {
 
 let lastHealthyAt = -Infinity;
 
-const busy = (b) => b.running > 0 || b.queued > 0 || b.slots.some((s) => s?.state && s.state !== 'idle');
+// strata reports running and slots only with batch slots; its state is "reading" while it prefills
+const busy = (b) => ['reading', 'generating'].includes(b.state) || b.running > 0 || b.queued > 0 || b.slots.some((s) => s?.state && s.state !== 'idle');
 
 async function pollOne(b) {
   try {
@@ -155,12 +173,14 @@ async function pollOne(b) {
     const live = m.live || {};
     b.healthy = true;
     b.fails = 0;
+    b.state = live.state || null;
     b.lastError = null;
     b.lastPoll = Date.now();
     b.slots = Array.isArray(live.slots) ? live.slots : [];
     b.running = live.running || 0;
     b.queued = live.queued || 0;
-    b.batch = m.engine?.batch_slots ?? 2;
+    // without batch slots strata answers one request at a time and queues the rest
+    b.batch = Math.max(1, Number(m.engine?.batch_slots) || 1);
     b.tok_s_mean = live.tok_s_mean ?? null;
     b.held_tokens = b.slots.reduce((s, x) => s + (x?.held_tokens || 0), 0);
     b.vram_free_mib = m.engine?.vram_free_mib ?? 0;
@@ -209,8 +229,9 @@ function capacity(b) {
   return b.healthy && b.queued === 0 && freeSlots(b) > 0;
 }
 
+// an unloaded engine has to load its model first (about 90 s), so it comes last
 function score(b) {
-  return freeSlots(b) * (b.tok_s_mean || 60) - b.queued * 50 - b.inflight * 30;
+  return freeSlots(b) * (b.tok_s_mean || 60) - b.queued * 50 - b.inflight * 30 - (b.state === 'unloaded' ? 1e6 : 0);
 }
 
 const best = (list) => list.reduce((a, b) => (score(b) > score(a) ? b : a));
@@ -276,7 +297,8 @@ async function pick(conv, isGone, exclude = null) {
     for (;;) {
       if (isGone() || draining) return {};
       const elapsed = performance.now() - t0;
-      const home = config.backends.find((b) => b.name === conv.backend && b !== exclude);
+      // a home that unloaded its model has lost the conversation's KV anyway
+      const home = config.backends.find((b) => b.name === conv.backend && b !== exclude && b.state !== 'unloaded');
       if (home && capacity(home)) return { b: reserve(home), waited };
 
       const healthy = config.backends.filter((b) => b.healthy && b !== exclude);
@@ -657,6 +679,7 @@ function handleGet(res, path) {
         name: b.name,
         host: addr(b),
         healthy: b.healthy,
+        state: b.state,
         poll_fails: b.fails,
         inflight: b.inflight,
         routed: b.routed,

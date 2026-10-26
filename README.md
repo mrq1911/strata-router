@@ -1,6 +1,6 @@
 # strata-router
 
-one OpenAI-compatible endpoint in front of several Strata engines, with
+one OpenAI-compatible endpoint in front of several [Strata](https://github.com/Niko1221/Strata) engines, with
 **conversation-sticky routing** so each conversation keeps its KV cache on the engine that warmed it.
 
     clients ──> http://localhost:8000/v1 ──┬──> engine A  (home of conversation 1, 2)
@@ -35,7 +35,7 @@ STRATA_BACKENDS="a=10.0.0.1:8080,b=10.0.0.2:8080" node router.mjs
 | `BIND` | `0.0.0.0` | listen address |
 | `POLL_MS` | `2000` | how often to read `GET /metrics` from each engine |
 | `POLL_FAILS` | `3` | failed polls in a row (timeouts, resets) before an engine counts as down |
-| `MAX_INFLIGHT` | `2` | per-engine cap; the router uses the smaller of this and the engine's reported batch slots |
+| `MAX_INFLIGHT` | `2` | per-engine cap; the router uses the smaller of this and the engine's reported batch slots (one when it has none) |
 | `MAX_QUEUE_WAIT` | `30000` | how long to wait for a free slot before handing the request to an engine's own queue |
 | `PREFILL_TOK_S` | `1400` | cold prefill speed until an engine's own is measured; decides how long a conversation waits for its busy home |
 | `CONNECT_TIMEOUT` | `10000` | TCP connect timeout to an engine; a failed connect marks it unhealthy until the next good poll |
@@ -43,6 +43,7 @@ STRATA_BACKENDS="a=10.0.0.1:8080,b=10.0.0.2:8080" node router.mjs
 | `MAX_CONVERSATIONS` | `500` | size of the conversation map (LRU) |
 | `PASSTHROUGH` | all | comma-separated POST paths the router relays to the engine; anything else gets 404 |
 | `STATE_FILE` | none | keeps conversation homes across restarts (written every minute and on shutdown) |
+| `STRATA_API_KEY_FILE` | none | file with the engines' API key, sent on the router's `/metrics` polls (see below) |
 | `SHUTDOWN_GRACE` | `30000` | how long answers in flight get to finish after SIGTERM |
 | `LOG` | on | set `LOG=off` to silence per-request lines |
 
@@ -121,7 +122,8 @@ sudo systemctl enable --now strata-router
 journalctl -u strata-router -f
 ```
 
-the unit runs as a dynamic user and keeps conversation homes in `/var/lib/strata-router`.
+the unit runs as a dynamic user and keeps conversation homes in `/var/lib/strata-router`. With keyed engines, add
+`LoadCredential=strata-key:/etc/strata-router/key` and `Environment=STRATA_API_KEY_FILE=%d/strata-key` to it.
 
 on SIGTERM the router saves conversation homes, stops accepting connections (requests on open ones get 503) and
 lets the answers in flight reach their clients for up to `SHUTDOWN_GRACE`, then gives clients a second to finish
@@ -137,6 +139,7 @@ docker run -d -p 8000:8000 --stop-timeout 40 -v strata-router:/data -e STATE_FIL
 ```
 
 `--stop-timeout` matters: docker kills the container 10 s after `docker stop` otherwise, cutting the drain short.
+With keyed engines, mount the key file and add `-e STRATA_API_KEY_FILE=/run/secrets/strata-key`.
 
 ## test without a GPU
 
@@ -179,12 +182,22 @@ pi (`~/.pi/agent/models.json`):
 `chatTemplateKwargs` is what carries pi's thinking level into the chat template (Qwen templates read
 `enable_thinking`); with `chat-template` alone pi sends no thinking flags. In `settings.json`:
 `"defaultProvider": "strata"`. opencode uses the same idea with
-`"npm": "@ai-sdk/openai-compatible"` and `"options": { "baseURL": "http://localhost:8000/v1" }`.
+`"npm": "@ai-sdk/openai-compatible"` and `"options": { "baseURL": "http://localhost:8000/v1" }`. With keyed
+engines, `apiKey` is the engines' key: the router passes it through.
 
 keep the direct engine endpoints as a second provider so you can A/B a conversation against the router.
 
 ## notes on engine configuration
 
+- an engine with an API key (Strata wants one whenever it listens beyond 127.0.0.1) answers `/metrics` only with
+  that key, so put it in a file and point `STRATA_API_KEY_FILE` at it, or the router sees the engine as down. All
+  engines share the one key. Clients still send the key on their own requests; the router never adds it, so it
+  can't hand keyed engines to anyone who reaches the router
+- Strata refuses host names it doesn't know (DNS rebinding protection) with `403 Host ... is not allowed`. List
+  engines by IP address in `STRATA_BACKENDS`, or add the names to each engine's `STRATA_ALLOWED_HOSTS`; an API key
+  also turns the check off
+- an engine that has unloaded its model (`state: unloaded` in its `/metrics`) is picked last, and its conversations
+  move: their KV is gone anyway, and loading the model takes about 90 s
 - the router fills each engine up to the smaller of `MAX_INFLIGHT` and the engine's reported batch slots; raise
   `MAX_INFLIGHT` when you run `--batch` above 2
 - set `PREFILL_TOK_S` to your measured cold prefill speed: it decides when waiting for a busy home beats moving

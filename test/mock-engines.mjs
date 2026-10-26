@@ -11,6 +11,13 @@ const json = (res, status, obj) => {
 };
 const event = (res, data) => res.write(`data: ${typeof data === 'string' ? data : JSON.stringify(data)}\n\n`);
 
+const authorized = (engine, req) => {
+  if (!engine.apiKey) return true;
+  const auth = req.headers.authorization || '';
+  return (auth.toLowerCase().startsWith('bearer ') ? auth.slice(7).trim() : req.headers['x-api-key']) === engine.apiKey;
+};
+const unauthorized = (res) => json(res, 401, { error: { type: 'authentication_error', message: 'missing or wrong API key' } });
+
 export function makeEngine(name, port, batch = 2, latencyMs = 300) {
   const engine = {
     name,
@@ -20,6 +27,9 @@ export function makeEngine(name, port, batch = 2, latencyMs = 300) {
     metricsStatus: 200,
     metricsHangup: false,
     reportIdle: false,
+    noBatch: false,
+    unloaded: false,
+    apiKey: '',
     prefillMs: 0,
     bigBytes: 8 << 20,
     usage: { ...USAGE },
@@ -38,19 +48,25 @@ export function makeEngine(name, port, batch = 2, latencyMs = 300) {
 
     if (req.url === '/metrics') {
       if (engine.metricsHangup) return req.socket.destroy();
+      if (!authorized(engine, req)) return unauthorized(res);
       if (engine.metricsStatus !== 200) return json(res, engine.metricsStatus, { error: 'model loading' });
       const running = engine.reportIdle ? 0 : inflight.size;
-      const slots = [];
-      for (let i = 0; i < batch; i++) slots.push({ slot: i, state: i < running ? 'decoding' : 'idle', held_tokens: i < running ? 1000 : 0 });
+      const live = { state: engine.unloaded ? 'unloaded' : running ? 'generating' : 'idle', queued: engine.queued, tok_s_mean: 60 };
+      if (!engine.noBatch) {
+        const slots = [];
+        for (let i = 0; i < batch; i++) slots.push({ slot: i, state: i < running ? 'decoding' : 'idle', held_tokens: i < running ? 1000 : 0 });
+        Object.assign(live, { running, slots, parallel: batch });
+      }
       json(res, 200, {
-        engine: { model: 'fake', batch_slots: batch, vram_free_mib: 1000 },
-        live: { state: running ? 'busy' : 'idle', queued: engine.queued, running, slots, parallel: batch, tok_s_mean: 60 },
+        engine: { model: 'fake', ...(engine.noBatch ? {} : { batch_slots: batch }), vram_free_mib: 1000 },
+        live,
         conversation_cache: { enabled: true, budget_mib: 32768, parked: 0, requests: 10, requests_reused: 5 },
       });
       return;
     }
 
     if (req.method !== 'POST') return json(res, 404, { error: 'engine 404' });
+    if (!authorized(engine, req)) return unauthorized(res);
 
     const chunks = [];
     req.on('data', (c) => chunks.push(c));

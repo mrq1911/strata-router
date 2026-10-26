@@ -2,7 +2,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
@@ -642,6 +642,50 @@ await scenario('no usage', async () => {
   setTimeout(() => (A.queued = 0), 300);
   const next = await chat(r, turns(opener, 1));
   check('no usage from the engine: patience comes from the request size', first.backend === 'A' && next.backend === 'A', `${first.backend} -> ${next.backend}`);
+});
+
+await scenario('api key', async () => {
+  const A = await engine('A', 20);
+  A.apiKey = 'sesame';
+  const bare = await router([A]);
+  const stat = (await get(bare, '/stats')).backends[0];
+  check('keyed engine without STRATA_API_KEY_FILE: down, and the error says why', stat.healthy === false && /STRATA_API_KEY_FILE/.test(stat.lastError), stat.lastError);
+
+  const dir = mkdtempSync(join(tmpdir(), 'strata-router-'));
+  try {
+    const keyFile = join(dir, 'key');
+    writeFileSync(keyFile, 'sesame\n');
+    const keyed = await router([A], { STRATA_API_KEY_FILE: keyFile });
+    const healthy = (await get(keyed, '/health')).backends[0].healthy;
+    const withKey = await post(keyed, '/v1/chat/completions', { model: 'fake', messages: [{ role: 'user', content: 'key' }] }, { headers: { 'content-type': 'application/json', authorization: 'Bearer sesame' } });
+    const withoutKey = await post(keyed, '/v1/chat/completions', { model: 'fake', messages: [{ role: 'user', content: 'no key' }] });
+    check('STRATA_API_KEY_FILE: polls get through, clients still need their own key', healthy && withKey.status === 200 && withoutKey.status === 401, `healthy=${healthy}, with key ${withKey.status}, without ${withoutKey.status}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await scenario('strata state', async () => {
+  const A = await engine('A', 20);
+  const B = await engine('B', 20);
+  A.noBatch = true;
+  B.noBatch = true;
+  const r = await router([A, B], { READ_TIMEOUT: '300' });
+  const quiet = await chat(r, turns('single-slot prefill', 0), { latency_ms: 1000 });
+  check('an engine without batch slots counts as busy from its state', quiet.status === 200 && quiet.backend === 'A' && B.posts === 0, `${quiet.status} from ${quiet.backend}, B got ${B.posts}`);
+
+  A.unloaded = true;
+  await sleep(300);
+  const fresh = await chat(r, turns('new while A is unloaded', 0));
+  const moved = await chat(r, turns('single-slot prefill', 1));
+  A.unloaded = false;
+  check('unloaded engines come last and lose their conversations', fresh.backend === 'B' && moved.backend === 'B', `new -> ${fresh.backend}, A's conversation -> ${moved.backend}`);
+
+  const solo = await router([A]);
+  const before = (await get(solo, '/stats')).stats.queued;
+  await Promise.all([chat(solo, turns('solo one', 0), { latency_ms: 300 }), chat(solo, turns('solo two', 0), { latency_ms: 300 })]);
+  const waited = (await get(solo, '/stats')).stats.queued - before;
+  check('an engine without batch slots takes one request at a time', waited === 1, `${waited} waited for the slot`);
 });
 
 for (const child of routers) child.kill('SIGKILL');
