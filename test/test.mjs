@@ -697,6 +697,9 @@ await scenario('dashboard and events', async () => {
   const page = await fetch(`${r.url}/dashboard`);
   const html = await page.text();
   check('/dashboard serves a self-contained html page', page.status === 200 && /^text\/html/.test(page.headers.get('content-type')) && html.startsWith('<!doctype html>') && !/https?:\/\//.test(html), `${page.status} ${page.headers.get('content-type')}, ${html.length} bytes`);
+  const icon = await fetch(`${r.url}/favicon.ico`);
+  const svg = await icon.text();
+  check('/favicon.ico serves the icon the page links to', icon.status === 200 && svg.startsWith('<svg') && html.includes('rel="icon" href="/favicon.ico"'), `${icon.status} ${icon.headers.get('content-type')}, ${svg.length} bytes`);
 
   const t0 = Date.now();
   const first = await chat(r, turns('route me', 0));

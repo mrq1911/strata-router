@@ -131,7 +131,7 @@ const addr = (b) => (b.host.includes(':') ? `[${b.host}]:${b.port}` : `${b.host}
 
 const ROUTED = new Set(['/v1/chat/completions', '/v1/completions', '/v1/messages', '/v1/responses']);
 // router data sits under /stats so it can't shadow an engine GET path, which gets relayed
-const LOCAL = new Set(['/', '/health', '/stats', '/stats/events', '/stats/conversations', '/dashboard']);
+const LOCAL = new Set(['/', '/health', '/stats', '/stats/events', '/stats/conversations', '/dashboard', '/favicon.ico']);
 const HOP = new Set(['connection', 'keep-alive', 'transfer-encoding', 'te', 'trailer', 'upgrade', 'proxy-authenticate', 'proxy-authorization']);
 // expect would stall the upstream request; accept-encoding would compress answers the router has to read
 const NOT_FORWARDED = new Set(['host', 'content-length', 'expect', 'accept-encoding']);
@@ -912,6 +912,10 @@ const convView = ([key, c]) => ({ key, backend: c.backend, turns: c.turns, promp
 
 function handleGet(res, path, query) {
   if (path === '/dashboard') return page(res);
+  if (path === '/favicon.ico') {
+    res.writeHead(200, { 'content-type': 'image/svg+xml', 'cache-control': 'public, max-age=86400' });
+    return res.end(FAVICON);
+  }
   if (path === '/stats/events') {
     const since = Number(new URLSearchParams(query).get('since')) || 0;
     return send(res, 200, {
@@ -982,12 +986,20 @@ function handleGet(res, path, query) {
   });
 }
 
+// one conversation (left) held by one of two engines (right, the filled one is its home)
+const FAVICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+<path d="M11 16L20.5 9.5M11 16L20.5 22.5" fill="none" stroke="#2a78d6" stroke-width="2.5" stroke-linecap="round"/>
+<circle cx="6.5" cy="16" r="5" fill="#2a78d6"/>
+<circle cx="25" cy="9" r="5" fill="#2a78d6"/>
+<circle cx="25" cy="23" r="5" fill="none" stroke="#2a78d6" stroke-width="2.5"/>
+</svg>`;
+
 function page(res) {
   res.writeHead(200, {
     'content-type': 'text/html; charset=utf-8',
     'cache-control': 'no-cache',
     // the page may only talk to the router: no cdn, fonts or other hosts
-    'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src data:",
+    'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:",
   });
   res.end(DASHBOARD);
 }
@@ -1108,7 +1120,7 @@ const DASHBOARD = String.raw`<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>strata-router</title>
-<link rel="icon" href="data:,">
+<link rel="icon" href="/favicon.ico">
 <style>
 :root {
   color-scheme: light dark;
