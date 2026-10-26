@@ -275,6 +275,101 @@ await scenario('health', async () => {
   check('nothing healthy: 503 without sitting out MAX_QUEUE_WAIT', res.status === 503 && ms < 2000, `${res.status} in ${ms}ms`);
 });
 
+await scenario('poll hysteresis', async () => {
+  const A = await engine('A', 20);
+  const B = await engine('B', 20);
+  const r = await router([A, B], { POLL_FAILS: '5' });
+  const home = await chat(r, turns('flaky metrics', 0));
+  A.metricsHangup = true;
+  await sleep(120);
+  const during = (await get(r, '/health')).backends[0].healthy;
+  const stay = await chat(r, turns('flaky metrics', 1));
+  A.metricsHangup = false;
+  check('a failed poll or two keeps the engine and its conversations', home.backend === 'A' && during && stay.backend === 'A', `${home.backend} -> ${stay.backend}, healthy during the blip: ${during}`);
+
+  await sleep(250);
+  A.metricsHangup = true;
+  const t0 = Date.now();
+  let down = false;
+  while (!down && Date.now() - t0 < 3000) {
+    await sleep(25);
+    down = (await get(r, '/health')).backends[0].healthy === false;
+  }
+  const ms = Date.now() - t0;
+  A.metricsHangup = false;
+  check('POLL_FAILS failed polls in a row mark it down', down && ms >= 300, `down after ${ms}ms`);
+});
+
+await scenario('learned prefill', async () => {
+  const A = await engine('A', 20);
+  const B = await engine('B', 20);
+  for (const e of [A, B]) Object.assign(e, { prefillMs: 500, usage: { prompt: 1500, cached: 0, completion: 10 } });
+  const r = await router([A, B], { PREFILL_TOK_S: '1000', MAX_QUEUE_WAIT: '10000' });
+  await Promise.all([stream(r, 'measure one'), stream(r, 'measure two')]);
+  const rates = (await get(r, '/stats')).backends.map((b) => b.prefill_tok_s);
+  check('prefill speed measured per engine, role-only opener ignored', rates.every((x) => x > 2000 && x < 3200), rates.join('/'));
+
+  const home = (await chat(r, turns('measure one', 1))).backend;
+  const busy = home === 'A' ? A : B;
+  busy.queued = 1;
+  await sleep(300);
+  const t0 = Date.now();
+  const moved = await chat(r, turns('measure one', 2));
+  const ms = Date.now() - t0;
+  busy.queued = 0;
+  check('patience follows the measured speed, not PREFILL_TOK_S', moved.backend !== home && ms >= 400 && ms < 1200, `${home} -> ${moved.backend} after ${ms}ms`);
+});
+
+await scenario('drain', async () => {
+  const A = await engine('A', 20);
+  const r = await router([A], { SHUTDOWN_GRACE: '5000' });
+  A.mode = 'slow';
+  const res = await post(r, '/v1/chat/completions', { model: 'fake', stream: true, messages: [{ role: 'user', content: 'finish me' }] });
+  const reader = res.body.getReader();
+  await reader.read();
+  const t0 = Date.now();
+  const exit = once(r.child, 'exit');
+  r.child.kill('SIGTERM');
+  await sleep(100);
+  const late = await post(r, '/v1/chat/completions', { model: 'fake', messages: [{ role: 'user', content: 'too late' }] }).then(
+    (x) => x.status,
+    (e) => e.cause?.code || e.message,
+  );
+  let text = '';
+  const decoder = new TextDecoder();
+  for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) text += decoder.decode(chunk.value, { stream: true });
+  const [code] = await exit;
+  const ms = Date.now() - t0;
+  check('SIGTERM lets the answer in flight finish', A.completed === 1 && text.includes('t19'), `completed=${A.completed}`);
+  check('... turns new work away and exits once idle', late !== 200 && code === 0 && ms < 3000, `late=${late}, exit ${code} after ${ms}ms`);
+});
+
+await scenario('settings', async () => {
+  const cases = [
+    { MAX_INFLIGHT: 'two' },
+    { STRATA_BACKENDS: '127.0.0.1:9,127.0.0.1:10' },
+    { STRATA_BACKENDS: 'a=host:99999' },
+    { PASSTHROUGH: 'v1/vram' },
+    { SHUTDOWN_GRACE: '99999999999' },
+  ];
+  for (const env of cases) {
+    const child = spawn(process.execPath, ['router.mjs'], {
+      env: { ...process.env, STRATA_BACKENDS: '127.0.0.1:9', PORT: String(nextPort++), ...env },
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.on('data', (c) => (stderr += c));
+    const timer = setTimeout(() => child.kill(), 3000);
+    const [code] = await once(child, 'exit');
+    clearTimeout(timer);
+    const [name, value] = Object.entries(env)[0];
+    check(`bad ${name}=${value} stops the router`, code === 1 && stderr.includes(name), stderr.trim());
+  }
+  const v6 = await router([], { STRATA_BACKENDS: 'v6=[::1]:9' });
+  const { host } = (await get(v6, '/health')).backends[0];
+  check('ipv6 engines parse', host === '[::1]:9', host);
+});
+
 await scenario('patience', async () => {
   const A = await engine('A', 50);
   const B = await engine('B', 50);

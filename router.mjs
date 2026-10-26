@@ -7,55 +7,95 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import { createHash } from 'node:crypto';
+import { dirname } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 const DEFAULT_BACKENDS = process.env.STRATA_BACKENDS || '127.0.0.1:8080';
+const problems = [];
 
 const config = {
   backends: parseBackends(DEFAULT_BACKENDS),
-  port: Number(process.env.PORT || 8000),
-  pollMs: Number(process.env.POLL_MS || 2000),
-  maxInflight: Number(process.env.MAX_INFLIGHT || 2),
-  queueWaitMs: Number(process.env.MAX_QUEUE_WAIT || 30000),
-  connectTimeoutMs: Number(process.env.CONNECT_TIMEOUT || 10000),
-  readTimeoutMs: Number(process.env.READ_TIMEOUT || 300000),
-  maxConversations: Number(process.env.MAX_CONVERSATIONS || 500),
-  prefillTokS: Number(process.env.PREFILL_TOK_S || 1400),
+  port: num('PORT', 8000, { min: 1, max: 65535 }),
+  pollMs: num('POLL_MS', 2000, { min: 10 }),
+  pollFails: num('POLL_FAILS', 3, { min: 1 }),
+  maxInflight: num('MAX_INFLIGHT', 2, { min: 1 }),
+  queueWaitMs: num('MAX_QUEUE_WAIT', 30000),
+  connectTimeoutMs: num('CONNECT_TIMEOUT', 10000, { min: 1 }),
+  readTimeoutMs: num('READ_TIMEOUT', 300000, { min: 1 }),
+  maxConversations: num('MAX_CONVERSATIONS', 500, { min: 1 }),
+  prefillTokS: num('PREFILL_TOK_S', 1400, { min: 1, integer: false }),
+  shutdownGraceMs: num('SHUTDOWN_GRACE', 30000),
   passthrough: new Set((process.env.PASSTHROUGH || '').split(',').map((s) => s.trim()).filter(Boolean)),
   stateFile: process.env.STATE_FILE || '',
   verbose: process.env.LOG !== 'off',
 };
 
-function parseBackends(spec) {
-  return spec
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map((entry) => {
-      // "name=host:port" or "host:port"
-      const [name, rest] = entry.includes('=') ? entry.split('=', 2) : [null, entry];
-      const [host, port] = rest.split(':');
-      return {
-        name: name || host,
-        host,
-        port: Number(port || 8080),
-        healthy: false,
-        slots: [],
-        running: 0,
-        queued: 0,
-        inflight: 0,
-        batch: 2,
-        tok_s_mean: null,
-        held_tokens: 0,
-        vram_free_mib: 0,
-        cache: null,
-        routed: 0,
-        lastError: null,
-        lastPoll: 0,
-      };
-    });
+for (const p of config.passthrough) if (!p.startsWith('/')) problems.push(`PASSTHROUGH entry "${p}": expected a path like /v1/vram`);
+if (config.stateFile) {
+  try {
+    fs.accessSync(dirname(config.stateFile), fs.constants.W_OK);
+  } catch (err) {
+    problems.push(`STATE_FILE=${config.stateFile}: directory not writable (${err.code})`);
+  }
 }
+if (problems.length) {
+  for (const p of problems) console.error(`strata-router: ${p}`);
+  process.exit(1);
+}
+
+// node timers fire after 1 ms when given more than 2^31-1 ms
+function num(name, fallback, { min = 0, max = 2 ** 31 - 1, integer = true } = {}) {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const n = Number(raw);
+  if (Number.isFinite(n) && n >= min && n <= max && (!integer || Number.isInteger(n))) return n;
+  problems.push(`${name}=${raw}: expected ${integer ? 'an integer' : 'a number'} from ${min} to ${max}`);
+  return fallback;
+}
+
+function parseBackends(spec) {
+  const entries = spec.split(',').map((s) => s.trim()).filter(Boolean);
+  if (!entries.length) problems.push('STRATA_BACKENDS: no engines configured');
+  const backends = [];
+  for (const entry of entries) {
+    // "name=host:port" or "host:port", ipv6 as [::1]:port
+    const m = entry.match(/^(?:([^=\s]+)=)?(\[[0-9a-fA-F:.]+\]|[^\s:=[\]]+)(?::(\d{1,5}))?$/);
+    const port = Number(m?.[3] || 8080);
+    if (!m || port < 1 || port > 65535) {
+      problems.push(`STRATA_BACKENDS entry "${entry}": expected host:port or name=host:port`);
+      continue;
+    }
+    const host = m[2].replace(/^\[(.*)\]$/, '$1');
+    backends.push({
+      name: m[1] || host,
+      host,
+      port,
+      healthy: false,
+      fails: 0,
+      slots: [],
+      running: 0,
+      queued: 0,
+      inflight: 0,
+      batch: 2,
+      tok_s_mean: null,
+      prefill_tok_s: null,
+      held_tokens: 0,
+      vram_free_mib: 0,
+      cache: null,
+      routed: 0,
+      lastError: null,
+      lastPoll: 0,
+    });
+  }
+  const names = backends.map((b) => b.name);
+  for (const name of new Set(names.filter((n, i) => names.indexOf(n) !== i))) {
+    problems.push(`STRATA_BACKENDS: more than one engine named "${name}"; name them, e.g. a=host:8080,b=host:8081`);
+  }
+  return backends;
+}
+
+const addr = (b) => (b.host.includes(':') ? `[${b.host}]:${b.port}` : `${b.host}:${b.port}`);
 
 const ROUTED = new Set(['/v1/chat/completions', '/v1/completions', '/v1/messages', '/v1/responses']);
 const LOCAL = new Set(['/', '/health', '/stats']);
@@ -87,7 +127,7 @@ function getJson(b, path, timeout = 5000) {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => {
-        if (res.statusCode !== 200) return reject(new Error(`${path} answered ${res.statusCode}`));
+        if (res.statusCode !== 200) return reject(Object.assign(new Error(`${path} answered ${res.statusCode}`), { definite: true }));
         try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); } catch (err) { reject(err); }
       });
       res.on('error', reject);
@@ -104,6 +144,7 @@ async function pollOne(b) {
     const m = await getJson(b, '/metrics');
     const live = m.live || {};
     b.healthy = true;
+    b.fails = 0;
     b.lastError = null;
     b.lastPoll = Date.now();
     b.slots = live.slots || [];
@@ -115,8 +156,10 @@ async function pollOne(b) {
     b.vram_free_mib = m.engine?.vram_free_mib ?? 0;
     b.cache = m.conversation_cache || null;
   } catch (err) {
-    b.healthy = false;
     b.lastError = String(err.message || err);
+    // an answer or a refused connection is final; a timeout may just be an engine busy prefilling
+    b.fails++;
+    if (err.definite || err.code === 'ECONNREFUSED' || b.fails >= config.pollFails) b.healthy = false;
   }
   wake();
 }
@@ -196,7 +239,16 @@ function remember(key, conv) {
 // how long a busy home is worth waiting for: past this, a cold prefill elsewhere is cheaper
 function patience(conv, home) {
   if (!home?.healthy) return 0;
-  return Math.min(config.queueWaitMs, (conv.prompt_tokens / config.prefillTokS) * 1000);
+  const rates = config.backends.filter((b) => b !== home && b.healthy).map((b) => b.prefill_tok_s || config.prefillTokS);
+  return Math.min(config.queueWaitMs, (conv.prompt_tokens / Math.max(config.prefillTokS / 10, ...rates)) * 1000);
+}
+
+// streamed turns with a mostly uncached prompt show how fast an engine really prefills
+function learnPrefill(b, u, firstTokenMs) {
+  const fresh = u.prompt - u.cached;
+  if (!(fresh >= 1000 && firstTokenMs >= 20)) return;
+  const rate = Math.min(config.prefillTokS * 10, Math.max(config.prefillTokS / 10, fresh / (firstTokenMs / 1000)));
+  b.prefill_tok_s = Math.round(b.prefill_tok_s ? 0.7 * b.prefill_tok_s + 0.3 * rate : rate);
 }
 
 // resolves to a backend with a slot already reserved, or none when nothing can take the request
@@ -204,7 +256,7 @@ async function pick(conv, isGone) {
   const t0 = Date.now();
   let waited = false;
   for (;;) {
-    if (isGone()) return {};
+    if (isGone() || draining) return {};
     const elapsed = Date.now() - t0;
     const home = config.backends.find((b) => b.name === conv.backend);
     if (home && capacity(home)) return { b: reserve(home), waited };
@@ -238,6 +290,13 @@ function normUsage(u) {
   };
 }
 
+// an event carrying generated text, reasoning or tool calls; role-only openers don't count
+function generated(o) {
+  const c = o?.choices?.[0];
+  if (c) return Boolean(c.text || c.delta?.content || c.delta?.reasoning_content || c.delta?.reasoning || c.delta?.tool_calls?.length);
+  return typeof o?.type === 'string' && /[._]delta$/.test(o.type) && o.type !== 'message_delta';
+}
+
 function usageTap(sse) {
   const dec = new StringDecoder('utf8');
   let buf = '';
@@ -251,9 +310,17 @@ function usageTap(sse) {
   const line = (l) => {
     const data = l.startsWith('data:') ? l.slice(5).trim() : '';
     if (!data || data === '[DONE]') return;
-    try { take(JSON.parse(data)); } catch {}
+    let o;
+    try {
+      o = JSON.parse(data);
+    } catch {
+      return;
+    }
+    if (!tap.firstTokenAt && generated(o)) tap.firstTokenAt = Date.now();
+    take(o);
   };
-  return {
+  const tap = {
+    firstTokenAt: 0,
     write(chunk) {
       size += chunk.length;
       if (!sse) {
@@ -276,6 +343,7 @@ function usageTap(sse) {
       return usage && normUsage(usage);
     },
   };
+  return tap;
 }
 
 function passHeaders(headers, b) {
@@ -346,7 +414,7 @@ function forward(b, req, url, payload, res, hold5xx = false) {
       });
       r.on('end', () => {
         res.end();
-        done({ ok: true, status: r.statusCode, usage: tap.end() });
+        done({ ok: true, status: r.statusCode, usage: tap.end(), firstTokenMs: tap.firstTokenAt && tap.firstTokenAt - t0 });
       });
     });
     up.on('socket', (s) => {
@@ -412,13 +480,12 @@ async function handleChat(req, res, raw) {
 
   const picked = await pick(conv, () => gone || res.destroyed);
   if (!picked.b) {
-    if (!gone) {
-      send(res, 503, {
-        error: 'no healthy backend',
-        backends: config.backends.map((x) => ({ name: x.name, healthy: x.healthy, error: x.lastError })),
-      });
-    }
-    return;
+    if (gone) return;
+    if (draining) return send(res, 503, { error: 'router is shutting down' });
+    return send(res, 503, {
+      error: 'no healthy backend',
+      backends: config.backends.map((x) => ({ name: x.name, healthy: x.healthy, error: x.lastError })),
+    });
   }
   stats.requests++;
   if (picked.waited) stats.queued++;
@@ -462,6 +529,7 @@ async function handleChat(req, res, raw) {
       stats.completion_tokens += u.completion;
       stats.cached_tokens += u.cached;
       conv.prompt_tokens = u.prompt;
+      if (out.firstTokenMs) learnPrefill(served, u, out.firstTokenMs);
     }
     const status = out.status === 200 ? '' : ` status=${out.status}`;
     log(`${served.name} key=${key} turns=${conv.turns}${status} prompt=${u?.prompt ?? '-'} cached=${u?.cached ?? '-'} out=${u?.completion ?? '-'} ${out.elapsed}ms`);
@@ -490,8 +558,9 @@ function handleGet(res, path) {
       stats,
       backends: config.backends.map((b) => ({
         name: b.name,
-        host: `${b.host}:${b.port}`,
+        host: addr(b),
         healthy: b.healthy,
+        poll_fails: b.fails,
         inflight: b.inflight,
         routed: b.routed,
         batch: b.batch,
@@ -499,6 +568,7 @@ function handleGet(res, path) {
         queued: b.queued,
         held_tokens: b.held_tokens,
         tok_s_mean: b.tok_s_mean,
+        prefill_tok_s: b.prefill_tok_s,
         vram_free_mib: b.vram_free_mib,
         parked: b.cache?.parked ?? 0,
         cache_budget_mib: b.cache?.budget_mib ?? 0,
@@ -511,7 +581,7 @@ function handleGet(res, path) {
   }
   send(res, 200, {
     ok: config.backends.some((b) => b.healthy),
-    backends: config.backends.map((b) => ({ name: b.name, host: `${b.host}:${b.port}`, healthy: b.healthy, inflight: b.inflight, queued: b.queued, running: b.running })),
+    backends: config.backends.map((b) => ({ name: b.name, host: addr(b), healthy: b.healthy, inflight: b.inflight, queued: b.queued, running: b.running })),
   });
 }
 
@@ -538,7 +608,14 @@ function saveState() {
   }
 }
 
+let draining = false;
+let active = 0;
+
 const server = http.createServer((req, res) => {
+  if (draining) {
+    res.setHeader('connection', 'close');
+    return send(res, 503, { error: 'router is shutting down' });
+  }
   const path = (req.url || '/').split('?')[0];
   if (req.method === 'GET' && LOCAL.has(path)) return handleGet(res, path);
 
@@ -549,13 +626,25 @@ const server = http.createServer((req, res) => {
   }
 
   readBody(req, res, (raw) => {
+    active++;
     const work = routed ? handleChat(req, res, raw) : relay(req, res, path === '/models' ? '/v1/models' : req.url, raw);
-    work.catch((err) => {
-      console.error('strata-router: unexpected error', err);
-      if (!res.headersSent) send(res, 500, { error: 'internal error' });
-      else res.destroy();
-    });
+    work
+      .catch((err) => {
+        console.error('strata-router: unexpected error', err);
+        if (!res.headersSent) send(res, 500, { error: 'internal error' });
+        else res.destroy();
+      })
+      .finally(() => {
+        active--;
+        if (draining && !active) exit();
+      });
   });
+});
+
+server.on('error', (err) => {
+  if (server.listening) return console.error('strata-router:', err.message);
+  console.error(`strata-router: cannot listen on ${process.env.BIND || '0.0.0.0'}:${config.port}: ${err.message}`);
+  process.exit(1);
 });
 
 loadState();
@@ -564,13 +653,24 @@ for (const b of config.backends) pollLoop(b);
 if (config.stateFile) setInterval(saveState, 60_000).unref();
 
 server.listen(config.port, process.env.BIND || '0.0.0.0', () => {
-  log(`strata-router on :${config.port} -> ${config.backends.map((b) => `${b.name}=${b.host}:${b.port}`).join(', ')}`);
+  log(`strata-router on :${config.port} -> ${config.backends.map((b) => `${b.name}=${addr(b)}`).join(', ')}`);
 });
 
+// stop taking requests, let the ones in flight finish; a second signal stops waiting
 function shutdown() {
-  saveState();
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 3000);
+  if (draining) return exit();
+  draining = true;
+  server.close();
+  wake();
+  if (!active) return exit();
+  log(`draining ${active} request(s) for up to ${config.shutdownGraceMs}ms`);
+  setTimeout(exit, config.shutdownGraceMs);
 }
+
+function exit() {
+  saveState();
+  process.exit(0);
+}
+
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);

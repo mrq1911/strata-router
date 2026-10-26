@@ -30,19 +30,23 @@ STRATA_BACKENDS="a=10.0.0.1:8080,b=10.0.0.2:8080" node router.mjs
 
 | env | default | meaning |
 |---|---|---|
-| `STRATA_BACKENDS` | `127.0.0.1:8080` | comma-separated `host:port` or `name=host:port` |
+| `STRATA_BACKENDS` | `127.0.0.1:8080` | comma-separated `host:port` or `name=host:port` (ipv6 as `[::1]:8080`) |
 | `PORT` | `8000` | listen port |
 | `BIND` | `0.0.0.0` | listen address |
 | `POLL_MS` | `2000` | how often to read `GET /metrics` from each engine |
+| `POLL_FAILS` | `3` | failed polls in a row (timeouts, resets) before an engine counts as down |
 | `MAX_INFLIGHT` | `2` | per-engine cap; the router uses the smaller of this and the engine's reported batch slots |
 | `MAX_QUEUE_WAIT` | `30000` | how long to wait for a free slot before handing the request to an engine's own queue |
-| `PREFILL_TOK_S` | `1400` | cold prefill speed; decides how long a conversation waits for its busy home before spilling |
+| `PREFILL_TOK_S` | `1400` | cold prefill speed until an engine's own is measured; decides how long a conversation waits for its busy home |
 | `CONNECT_TIMEOUT` | `10000` | TCP connect timeout to an engine; a failed connect marks it unhealthy until the next good poll |
 | `READ_TIMEOUT` | `300000` | idle timeout on an engine response (long prefills need it) |
 | `MAX_CONVERSATIONS` | `500` | size of the conversation map (LRU) |
 | `PASSTHROUGH` | all | comma-separated POST paths the router relays to the engine; anything else gets 404 |
 | `STATE_FILE` | none | keeps conversation homes across restarts (written every minute and on shutdown) |
+| `SHUTDOWN_GRACE` | `30000` | how long answers in flight get to finish after SIGTERM |
 | `LOG` | on | set `LOG=off` to silence per-request lines |
+
+a bad value stops the router at startup with a message naming it, rather than routing strangely later.
 
 ## endpoints
 
@@ -64,8 +68,13 @@ STRATA_BACKENDS="a=10.0.0.1:8080,b=10.0.0.2:8080" node router.mjs
   for `/v1/completions`). Forks and branches of a conversation share the key, so they inherit the same home
   engine and reuse the prefix cache.
 - **sticky** while the home engine is healthy, has an empty queue and a free batch slot.
+- **healthy** until `POLL_FAILS` polls in a row time out or fail, so an engine too busy prefilling to answer
+  `/metrics` quickly keeps its conversations. A refused connection, a non-200 `/metrics` or a request that can't
+  connect marks it down at once.
 - **patient** when the home is busy: wait for its slot as long as a cold prefill of the conversation would take
-  elsewhere (last turn's prompt tokens ÷ `PREFILL_TOK_S`, capped at `MAX_QUEUE_WAIT`). New conversations don't wait.
+  elsewhere (last turn's prompt tokens ÷ the fastest other engine's prefill speed, capped at `MAX_QUEUE_WAIT`).
+  Prefill speed is measured per engine from streamed turns with at least 1,000 uncached prompt tokens, starting
+  from `PREFILL_TOK_S`. New conversations don't wait.
 - **spill** to the least-loaded engine with a free slot after that, or right away when the home is down; the home
   moves with the conversation.
 - **queue** up to `MAX_QUEUE_WAIT` when every engine is full, first come first served, then hand the request to
@@ -85,6 +94,8 @@ STRATA_BACKENDS="a=10.0.0.1:8080,b=10.0.0.2:8080" node router.mjs
 - `parked` — conversations parked in the engine's conversation cache (needs `--conversation-cache-mib`)
 - `reused/requests` — engine-side prompt cache hit rate
 - `tok_s_mean` — rolling decode speed used for the load score
+- `prefill_tok_s` — measured cold prefill speed (empty until a long enough streamed turn ran there)
+- `poll_fails` — failed polls in a row
 
 and globally: `cold` (new conversations, i.e. prefills), `migrated` (conversations whose home moved), `queued`
 (requests that waited for a slot), `overflow` (handed to a full engine after `MAX_QUEUE_WAIT`), `retried`, and
@@ -104,13 +115,18 @@ journalctl -u strata-router -f
 
 the unit runs as a dynamic user and keeps conversation homes in `/var/lib/strata-router`.
 
+on SIGTERM the router stops taking requests and lets the answers in flight finish for up to `SHUTDOWN_GRACE`;
+a second signal exits at once. systemd's default 90 s stop timeout covers the default grace.
+
 ## docker
 
 ```bash
 docker build -t strata-router .
-docker run -d -p 8000:8000 -v strata-router:/data -e STATE_FILE=/data/homes.json \
+docker run -d -p 8000:8000 --stop-timeout 40 -v strata-router:/data -e STATE_FILE=/data/homes.json \
   -e STRATA_BACKENDS="a=10.0.0.1:8080,b=10.0.0.2:8080" strata-router
 ```
+
+`--stop-timeout` matters: docker kills the container 10 s after `docker stop` otherwise, cutting the drain short.
 
 ## test without a GPU
 

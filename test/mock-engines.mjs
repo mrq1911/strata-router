@@ -12,7 +12,7 @@ const json = (res, status, obj) => {
 const event = (res, data) => res.write(`data: ${typeof data === 'string' ? data : JSON.stringify(data)}\n\n`);
 
 export function makeEngine(name, port, batch = 2, latencyMs = 300) {
-  const engine = { name, port, mode: 'ok', queued: 0, metricsStatus: 200, posts: 0, aborted: 0, completed: 0 };
+  const engine = { name, port, mode: 'ok', queued: 0, metricsStatus: 200, metricsHangup: false, prefillMs: 0, usage: { ...USAGE }, posts: 0, aborted: 0, completed: 0 };
   const inflight = new Set();
 
   engine.server = http.createServer((req, res) => {
@@ -22,6 +22,7 @@ export function makeEngine(name, port, batch = 2, latencyMs = 300) {
     }
 
     if (req.url === '/metrics') {
+      if (engine.metricsHangup) return req.socket.destroy();
       if (engine.metricsStatus !== 200) return json(res, engine.metricsStatus, { error: 'model loading' });
       const slots = [];
       for (let i = 0; i < batch; i++) {
@@ -97,7 +98,7 @@ function generate(engine, req, res, body, raw, latencyMs) {
 
 function reply(engine, req, res, body, raw) {
   const text = `answer from ${engine.name}`;
-  const { prompt, cached, completion } = USAGE;
+  const { prompt, cached, completion } = engine.usage;
 
   if (req.url.startsWith('/v1/messages')) {
     return json(res, 200, {
@@ -119,10 +120,13 @@ function reply(engine, req, res, body, raw) {
   const usage = { prompt_tokens: prompt, completion_tokens: completion, prompt_tokens_details: { cached_tokens: cached } };
   if (body.stream) {
     res.writeHead(200, { 'content-type': 'text/event-stream' });
-    for (const content of ['answer from ', engine.name]) event(res, { object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content } }], usage: null });
-    event(res, { object: 'chat.completion.chunk', choices: [], usage });
-    event(res, '[DONE]');
-    res.end();
+    event(res, { object: 'chat.completion.chunk', choices: [{ index: 0, delta: { role: 'assistant', content: '' } }], usage: null });
+    setTimeout(() => {
+      for (const content of ['answer from ', engine.name]) event(res, { object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content } }], usage: null });
+      event(res, { object: 'chat.completion.chunk', choices: [], usage });
+      event(res, '[DONE]');
+      res.end();
+    }, engine.prefillMs);
     return;
   }
 
