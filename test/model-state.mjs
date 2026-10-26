@@ -1,6 +1,8 @@
 import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
-const d = JSON.parse(readFileSync(process.argv[2] || '/home/claude/.pi/agent/models.json', 'utf8'));
+const d = JSON.parse(readFileSync(process.argv[2] || join(homedir(), '.pi/agent/models.json'), 'utf8'));
 for (const [pid, p] of Object.entries(d.providers)) {
   for (const m of p.models || []) {
     if (p.api !== 'openai-completions' && p.api !== 'openai-responses') continue;
