@@ -40,6 +40,7 @@ export function makeEngine(name, port, batch = 2, latencyMs = 300) {
     completed: 0,
     since: Date.now() / 1000,
     parks: 0,
+    reportRecent: false,
     // a new server start, or with sameServer the engine alone, which only zeroes the cache counters
     restart({ sameServer = false } = {}) {
       if (!sameServer) engine.since += 1;
@@ -80,7 +81,7 @@ export function makeEngine(name, port, batch = 2, latencyMs = 300) {
         totals: { since: engine.since, requests: engine.posts },
         hardware: { gpu_util: 50, gpu_mem_used: 20e9, gpu_mem_total: 24e9, cpu: 10, ram_used: 50e9, ram_total: 64e9 },
         history: { gpu_util: [10, 50], tok_s: [0, 60] },
-        requests: p ? [{ output_tokens: 50, decode_tok_s: 100, prompt_read: 2000, prompt_ms: 1000, hit_rate: 0.9, pcie_share: 0.01, drafts_offered: 10, drafts_accepted: 6 }] : [],
+        requests: engine.badRequests ? [null] : p && engine.reportRecent ? [{ output_tokens: 50, decode_tok_s: 100, prompt_read: 2000, prompt_ms: 1000, hit_rate: 0.9, pcie_share: 0.01, drafts_offered: 10, drafts_accepted: 6 }] : [],
       });
       return;
     }
@@ -160,8 +161,33 @@ function generate(engine, req, res, body, raw, latencyMs) {
 
 function reply(engine, req, res, body, raw) {
   const text = `answer from ${engine.name}`;
-  const { prompt, cached, completion } = engine.usage || {};
+  // usageFromSize: a prompt as long as the request (4 bytes a token), none of it cached
+  const sized = engine.usageFromSize && { prompt: Math.round(raw.length / 4), cached: 0, completion: 10 };
+  const { prompt, cached, completion } = sized || engine.usage || {};
   const usage = engine.usage && { prompt_tokens: prompt, completion_tokens: completion, prompt_tokens_details: { cached_tokens: cached } };
+  const stream = (events) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    setTimeout(() => {
+      for (const [name, data] of events) res.write(`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`);
+      setTimeout(() => res.end(), engine.tailMs);
+    }, engine.prefillMs);
+  };
+
+  if (req.url.startsWith('/v1/messages') && body.stream) {
+    return stream([
+      ['message_start', { type: 'message_start', message: { role: 'assistant', usage: { input_tokens: prompt - cached, cache_read_input_tokens: cached, cache_creation_input_tokens: 0, output_tokens: 1 } } }],
+      ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } }],
+      ['message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: completion } }],
+      ['message_stop', { type: 'message_stop' }],
+    ]);
+  }
+
+  if (req.url.startsWith('/v1/responses') && body.stream) {
+    return stream([
+      ['response.output_text.delta', { type: 'response.output_text.delta', delta: text }],
+      ['response.completed', { type: 'response.completed', response: { usage: { input_tokens: prompt, input_tokens_details: { cached_tokens: cached }, output_tokens: completion } } }],
+    ]);
+  }
 
   if (req.url.startsWith('/v1/messages')) {
     return json(res, 200, {

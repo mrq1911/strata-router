@@ -44,7 +44,7 @@ STRATA_BACKENDS="a=10.0.0.1:8080,b=10.0.0.2:8080" node router.mjs
 | `READ_TIMEOUT` | `300000` | how long an engine may stay silent before the router checks on it (see routing rules) |
 | `MAX_CONVERSATIONS` | `500` | size of the conversation map (LRU) |
 | `PASSTHROUGH` | all | comma-separated POST paths the router relays to the engine; anything else gets 404 |
-| `STATE_FILE` | none | keeps conversation homes across restarts (written every minute and on shutdown) |
+| `STATE_FILE` | none | keeps conversation homes across restarts (written every minute and on shutdown), with each engine's start time, so homes on an engine that restarted meanwhile are dropped |
 | `STRATA_API_KEY_FILE` | none | file with the engines' API key, sent on the router's `/metrics` polls (see below) |
 | `SHUTDOWN_GRACE` | `30000` | how long answers in flight get to finish after SIGTERM |
 | `LOG` | on | set `LOG=off` to silence per-request lines |
@@ -77,30 +77,34 @@ a bad value stops the router at startup with a message naming it, rather than ro
 - **healthy** until `POLL_FAILS` polls in a row time out or fail, so an engine too busy prefilling to answer
   `/metrics` quickly keeps its conversations. A refused connection, a non-200 `/metrics` or a request that can't
   connect marks it down at once.
-- **patient** when the home is busy: wait for its slot as long as a cold prefill of the conversation would take
-  elsewhere (last turn's prompt tokens ÷ the fastest other engine's prefill speed, capped at `MAX_QUEUE_WAIT`),
-  and hold the home's next free slot against newcomers meanwhile (for at most 2 s of a newcomer's wait, so short
-  side requests can't starve behind it). Prefill speed is measured per engine from
-  streamed turns with at least 1,000 uncached prompt tokens, starting from `PREFILL_TOK_S`; without usage in the
-  answers, the prompt size is estimated from the request. New conversations don't wait.
+- **patient** when the home is busy: wait for its slot as long as reading this request's prompt elsewhere would
+  take (its tokens ÷ the fastest other loaded engine's prompt speed, capped at `MAX_QUEUE_WAIT`), and hold the
+  home's next free slot against newcomers meanwhile (for at most 2 s of a newcomer's wait, so short side requests
+  can't starve behind it). The tokens are estimated from the request's size and the bytes per token its
+  conversation's last answer showed (4 to start with), so a short fork doesn't shorten the wait of the long turn
+  after it. An engine's prompt speed is its own median over its recent requests when it reports them in
+  `/metrics`; otherwise the router measures it from streamed turns with at least 1,000 uncached prompt tokens,
+  starting from `PREFILL_TOK_S`. New conversations don't wait.
 - **spill** after that, or right away when the home is down, to another engine picked like a new conversation's;
   the home moves with the conversation.
-- **new conversations** (and spills) go to an engine with its model loaded and the most free slots, so concurrent
+- **new conversations** (and spills) go to an engine with its model loaded (one that has to load it first, about
+  90 s, only takes work when no loaded engine is up) and the most free slots, so concurrent
   work spreads over the boxes; between equals, to the one busy least lately, so both boxes work about as long
   (a slower one gets less); then to the faster prompt reader; then in `STRATA_BACKENDS` order. "Busy lately" is
   the share of its slots in use at each poll, direct requests included, weighted toward the last 10 minutes.
 - **queue** up to `MAX_QUEUE_WAIT` when every engine is full, then hand the request to the home engine's own queue.
   Waiting requests get freed slots in arrival order, except that short ones (under `SHORT_PROMPT_TOKENS`, like a
   side request summarizing a turn) go first, ahead of longer ones that have waited less than 5 s: a short request
-  usually gives its slot back quickly, where waiting behind a long one costs it a whole turn.
+  usually gives its slot back quickly, where waiting behind a long one costs it a whole turn. Likewise a long
+  request about to take a slot that a waiting short one could use lets it go first, once, within its first 5 s.
 - **direct use** counts: requests a client sends to an engine directly, not through the router, take its slots too.
   Each poll compares the requests the engine says it runs with the ones the router sent (one the router finished
   while the poll was out still counts as its own), and requests seen twice in a row beyond those count as taken
   slots, so routed requests wait or go elsewhere instead of queueing inside a busy engine. The dashboard marks them
   `direct`. Their conversations still share the engine's cache, which the router can't see beyond its evictions.
-- **restart**: when an engine restarts (a new start time in its `/metrics`, or its conversation cache counters
-  starting over, which is how Strata restarting a stuck engine shows), its cache is empty, so its conversations
-  lose their home there and go wherever there is room, without waiting for it.
+- **restart**: when an engine loses its cache (a new server start time in its `/metrics`, its conversation cache
+  counters starting over, or its model unloading, which is also what Strata reports while it brings a restarted
+  engine back up), its conversations lose their home there and go wherever there is room, without waiting for it.
 - **fail fast** with 503 once no engine has been healthy for a poll interval, instead of queueing.
 - **retry** on another engine, queueing for it like any request, when the engine never started an answer: it
   refused or timed out the connection, reset it before answering, or answered 5xx. Once a response has started,
@@ -108,9 +112,14 @@ a bad value stops the router at startup with a message naming it, rather than ro
   reply. With nowhere to retry, the engine's own error is passed on.
 - **silence** is not failure: when an engine says nothing for `READ_TIMEOUT`, the request keeps waiting as long as
   the engine still reports work in `/metrics` (long prefills and non-streamed answers can be silent for minutes).
-  It is given up only when the engine is idle or down, and then retried elsewhere if nothing reached the client
-  yet (504 otherwise). A request whose answer hasn't reached the client moves as soon as polls give its engine
-  up, without sitting out `READ_TIMEOUT`; one already streaming is left to finish or time out.
+  It is given up only when the engine is idle or down: retried elsewhere if nothing reached the client yet, or
+  answered 504 when there is nowhere else; an answer already streaming is cut. A request whose answer hasn't
+  reached the client moves as soon as polls give its engine up, without sitting out `READ_TIMEOUT`.
+- **stuck clients**: a client that stops reading its answer holds the slot for `READ_TIMEOUT` at most, then the
+  request is cancelled and counts as `gone`.
+- **finished early**: a client may hang up as soon as it has the stream's last event (`data: [DONE]`, Anthropic's
+  `message_stop` or `error`, a Responses `response.completed`, `.incomplete` or `.failed`), before the engine closes the
+  stream; the OpenAI SDK does. Once the chunk carrying it has left the router, that is a whole answer.
 - **cancel**: a client that disconnects aborts the engine request and frees its slot, pipelined requests included.
 - **paths** with a trailing or doubled slash route like the canonical ones.
 
@@ -125,8 +134,10 @@ a bad value stops the router at startup with a message naming it, rather than ro
 - `busy` — the share of its slots in use lately (0 to 1, weighted toward the last 10 minutes), which new
   conversations balance
 - `prefill_tok_s` — measured cold prefill speed (empty until a long enough streamed turn ran there)
-- `version`, `started` — the engine's version and start time (ms since the epoch), from its `/metrics`
-- `restarts` — restarts the router noticed; `slow` — answers whose first token was flagged slow (see `SLOW_FIRST_TOKEN`)
+- `version`, `started` — the engine's version, and when its Strata server started (ms since the epoch); an engine
+  restarted inside a running server doesn't change it
+- `restarts` — times the router saw the engine lose its cache (see the restart rule); `slow` — answers whose first
+  token was flagged slow (see `SLOW_FIRST_TOKEN`)
 - `direct` — requests running on the engine that the router didn't send; they count against `capacity`
 - `parks`, `evictions`, `cache_slots`, `reused_tokens/prompt_tokens` — the conversation cache's own counters, and
   the share of prompt tokens it served
@@ -137,8 +148,8 @@ a bad value stops the router at startup with a message naming it, rather than ro
 - `recent` — from the engine's last requests: median decode and prefill speed, expert cache hits, PCIe share and
   draft acceptance
 - `poll_fails` — failed polls in a row
-- `capacity` — slots the router fills, the smaller of `MAX_INFLIGHT` and the batch slots (less any taken by `direct`
-  requests); `inflight` passes it after an overflow
+- `capacity` — the most slots the router fills, the smaller of `MAX_INFLIGHT` and the batch slots; `direct` requests
+  take from the batch slots, and `inflight` passes it after an overflow
 - `claimed` — conversations holding out for this engine as their busy home
 - `conversations` — conversations whose home it is
 

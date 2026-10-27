@@ -586,7 +586,7 @@ await scenario('state on kill', async () => {
     r.child.kill('SIGKILL');
     await exit;
     await busyStream;
-    const saved = existsSync(STATE_FILE) ? JSON.parse(readFileSync(STATE_FILE, 'utf8')).length : 0;
+    const saved = existsSync(STATE_FILE) ? JSON.parse(readFileSync(STATE_FILE, 'utf8')).conversations.length : 0;
     check('homes are saved when the drain starts, so a kill mid-drain keeps them', saved >= 1, `${saved} saved`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -888,12 +888,199 @@ await scenario('slow first token', async () => {
   const [quick, stalled] = (await get(r, '/stats/events')).events;
   const st = await get(r, '/stats');
   check('a first token far slower than the uncached prompt needs is flagged', !quick.slow && stalled.slow && stalled.engine_ttft_ms >= 400 && stalled.expected_ttft_ms === 20 && st.stats.slow === 1 && st.backends[0].slow === 1, JSON.stringify({ quick: [quick.slow, quick.engine_ttft_ms], stalled: [stalled.slow, stalled.engine_ttft_ms, stalled.expected_ttft_ms] }));
+  A.reportRecent = true;
+  await sleep(300);
   const pending = chat(r, turns('busy now', 0), { latency_ms: 800 });
   await sleep(400);
   const [busy, inflight] = [(await get(r, '/stats')).backends[0], (await get(r, '/stats/events')).live];
   await pending;
   check('/stats shows what the engine is doing, for which conversation, and its hardware and recent speed', busy.activity.length === 1 && busy.activity[0].key === inflight[0]?.key && busy.activity[0].state === 'decoding' && busy.hardware.gpu_util === 50 && busy.history.gpu_util.length === 2 && busy.recent.decode_tok_s === 100 && busy.recent.prefill_tok_s === 2000 && busy.recent.draft_accept === 0.6, JSON.stringify({ activity: busy.activity, recent: busy.recent }));
   check('/stats shows engine version and cache counters, and the router settings the dashboard explains', st.settings.max_queue_wait_ms === 30000 && st.backends[0].version === '0.0-mock' && st.backends[0].parks >= 1 && st.backends[0].prompt_tokens >= 1000 && st.backends[0].started > 0, JSON.stringify(st.backends[0]));
+});
+
+// a client that stops reading its answer, and hangs up after hangupMs unless that is null
+function stalled(r, body, hangupMs) {
+  const url = new URL(r.url);
+  const req = http.request({ host: url.hostname, port: url.port, path: '/v1/chat/completions', method: 'POST', headers: { 'content-type': 'application/json' } });
+  req.on('response', (res) => {
+    res.pause();
+    if (hangupMs != null) setTimeout(() => req.destroy(), hangupMs);
+  });
+  req.on('error', () => {});
+  req.end(JSON.stringify(body));
+  return req;
+}
+
+await scenario('stuck clients', async () => {
+  const A = await engine('A', 0);
+  A.mode = 'big';
+  const r = await router([A], { READ_TIMEOUT: '600' });
+  // the engine finishes while the router waits on the client, then the client hangs up; which sizes do that
+  // depends on socket buffers, so try a range
+  for (let kb = 2048; kb <= 3686; kb += 102) {
+    A.bigBytes = kb * 1024;
+    stalled(r, { model: 'fake', messages: [{ role: 'user', content: `stuck ${kb}` }] }, 300);
+    await sleep(450);
+  }
+  await sleep(500);
+  const leaked = (await get(r, '/health')).backends[0].inflight;
+  A.bigBytes = 8 << 20;
+  const hung = stalled(r, { model: 'fake', messages: [{ role: 'user', content: 'hung' }] }, null);
+  await sleep(300);
+  const during = (await get(r, '/health')).backends[0].inflight;
+  await sleep(1200);
+  const after = (await get(r, '/health')).backends[0].inflight;
+  const ev = (await get(r, '/stats/events')).events.at(-1);
+  hung.destroy();
+  check('a client hanging up while the router waits on it frees the slot, wherever the engine got to', leaked === 0, `${leaked} slot(s) still taken`);
+  check('a client that stops reading holds its slot for READ_TIMEOUT, then counts as gone', during === 1 && after === 0 && ev.kind === 'gone' && ev.error === 'client stopped reading', `${during} -> ${after}, ${ev.kind} ${ev.error}`);
+});
+
+await scenario('step aside', async () => {
+  const A = await engine('A', 20);
+  const B = await engine('B', 20);
+  const r = await router([A, B], { MAX_INFLIGHT: '1', PREFILL_TOK_S: '1000', MAX_QUEUE_WAIT: '10000' });
+  const first = await chat(r, turns('short one', 0));
+  const [home, other] = first.backend === 'A' ? [A, B] : [B, A];
+  home.queued = 1;
+  await sleep(300);
+  const waiting = chat(r, turns('short one', 1));
+  await sleep(100);
+  const t0 = Date.now();
+  const long = await chat(r, turns(`long newcomer ${'x'.repeat(12000)}`, 0));
+  const ms = Date.now() - t0;
+  home.queued = 0;
+  await waiting;
+  check('a long request doesn\'t wait for a short one that waits for another engine', long.backend === other.name && ms < 400, `${long.backend} after ${ms}ms`);
+});
+
+await scenario('patience by size', async () => {
+  const A = await engine('A', 20);
+  const B = await engine('B', 20);
+  A.usageFromSize = B.usageFromSize = true;
+  const r = await router([A, B], { PREFILL_TOK_S: '1000', MAX_QUEUE_WAIT: '10000' });
+  const branch = (last) => [{ role: 'user', content: 'branchy' }, { role: 'assistant', content: 'x' }, { role: 'user', content: last }];
+  const first = await chat(r, branch('y'.repeat(16000)));
+  const home = first.backend === 'A' ? A : B;
+  await chat(r, branch('a short fork'));
+  home.queued = 1;
+  await sleep(300);
+  setTimeout(() => (home.queued = 0), 2500);
+  const t0 = Date.now();
+  const next = await chat(r, branch('y'.repeat(17000)));
+  const ms = Date.now() - t0;
+  check('a short fork doesn\'t cut how long the next long turn waits for its home', next.backend === first.backend && ms >= 2000, `${next.backend} after ${ms}ms`);
+});
+
+await scenario('unloaded engines', async () => {
+  const A = await engine('A', 20);
+  const B = await engine('B', 20);
+  const r = await router([A, B], { PREFILL_TOK_S: '1000', MAX_QUEUE_WAIT: '10000' });
+  const first = await chat(r, turns('lives here', 0));
+  const [home, other] = first.backend === 'A' ? [A, B] : [B, A];
+  home.unloaded = true;
+  await sleep(300);
+  home.unloaded = false;
+  await sleep(300);
+  await chat(r, turns('lives here', 1));
+  const ev = (await get(r, '/stats/events')).events.at(-1);
+  const restarts = (await get(r, '/stats')).stats.restarts;
+  check('an engine that unloads its model loses its conversations\' homes', ev.kind === 'cold' && restarts === 1, `${ev.kind}, restarts ${restarts}`);
+
+  home.unloaded = true;
+  other.queued = 1;
+  await sleep(300);
+  setTimeout(() => (other.queued = 0), 1000);
+  const t0 = Date.now();
+  const fresh = await chat(r, turns('nothing loaded is free', 0));
+  const ms = Date.now() - t0;
+  home.unloaded = false;
+  check('an engine with its model unloaded takes no work while a loaded one is about to free up', fresh.backend === other.name && ms >= 800, `${fresh.backend} after ${ms}ms`);
+});
+
+await scenario('restart while away', async () => {
+  const A = await engine('A', 20);
+  const dir = mkdtempSync(join(tmpdir(), 'strata-router-'));
+  try {
+    const STATE_FILE = join(dir, 'homes.json');
+    const before = await router([A], { STATE_FILE });
+    await chat(before, turns('across restarts', 0));
+    before.child.kill('SIGTERM');
+    await once(before.child, 'exit');
+    A.restart();
+    const after = await router([A], { STATE_FILE });
+    await chat(after, turns('across restarts', 1));
+    const ev = (await get(after, '/stats/events')).events.at(-1);
+    const restarts = (await get(after, '/stats')).stats.restarts;
+    check('an engine that restarted while the router was down has lost the homes the router saved', ev.kind === 'cold' && restarts === 1, `${ev.kind}, restarts ${restarts}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await scenario('slow engine learns', async () => {
+  const A = await engine('A', 20);
+  A.usage = { prompt: 5000, cached: 0, completion: 10 };
+  A.prefillMs = 1000;
+  const r = await router([A], { PREFILL_TOK_S: '20000', SLOW_FIRST_TOKEN: '100' });
+  await stream(r, 'slow one');
+  await stream(r, 'slow two');
+  const [one, two] = (await get(r, '/stats/events')).events;
+  const learned = (await get(r, '/stats')).backends[0].prefill_tok_s;
+  check('an engine far slower than PREFILL_TOK_S still learns its own speed, and then isn\'t flagged', one.slow && learned > 0 && learned < 10000 && !two.slow, `learned ${learned}, slow ${one.slow} then ${two.slow}`);
+});
+
+await scenario('hang-up after the last event', async () => {
+  const A = await engine('A', 20);
+  A.tailMs = 300;
+  const r = await router([A]);
+  for (const [path, body, last] of [
+    ['/v1/messages', { model: 'fake', max_tokens: 10, stream: true, messages: [{ role: 'user', content: 'anthropic sdk style' }] }, '"type":"message_stop"'],
+    ['/v1/responses', { model: 'fake', stream: true, input: 'responses sdk style' }, '"type":"response.completed"'],
+  ]) {
+    const res = await post(r, path, body);
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let text = '';
+    while (!text.includes(last)) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      text += dec.decode(value, { stream: true });
+    }
+    await reader.cancel();
+  }
+  await sleep(500);
+  const ev = (await get(r, '/stats/events')).events;
+  check('anthropic and responses streams: a hang-up after the last event is a whole answer, usage and first token included', ev.length === 2 && ev.every((e) => e.kind === 'cold' && e.prompt_tokens === 1000 && e.ttft_ms != null), JSON.stringify(ev.map((e) => [e.kind, e.prompt_tokens, e.ttft_ms])));
+});
+
+await scenario('engine view', async () => {
+  const A = await engine('A', 20);
+  const B = await engine('B', 20);
+  B.noBatch = true;
+  A.badRequests = true;
+  const r = await router([A, B]);
+  await sleep(400);
+  const odd = (await get(r, '/stats')).backends.find((b) => b.name === 'A');
+  check('an odd field in /metrics doesn\'t fail the poll', odd.healthy && odd.poll_fails === 0 && odd.recent === null, JSON.stringify({ healthy: odd.healthy, fails: odd.poll_fails, recent: odd.recent }));
+
+  A.queued = 1;
+  await sleep(300);
+  const pending = chat(r, turns('one at a time', 0), { latency_ms: 800 });
+  await sleep(400);
+  const solo = (await get(r, '/stats')).backends.find((b) => b.name === 'B');
+  await pending;
+  A.queued = 0;
+  check('an engine without batch slots reports the request it runs', solo.running === 1, `running ${solo.running}`);
+
+  const busy = chat(r, turns('busy when it goes quiet', 0), { latency_ms: 1500 });
+  await sleep(300);
+  A.metricsHangup = B.metricsHangup = true;
+  await sleep(700);
+  const down = (await get(r, '/stats')).backends;
+  A.metricsHangup = B.metricsHangup = false;
+  await busy;
+  check('an engine that stopped answering polls shows no stale work', down.every((b) => !b.healthy && b.running === 0 && b.activity.length === 0), JSON.stringify(down.map((b) => [b.name, b.healthy, b.running, b.activity.length])));
 });
 
 for (const child of routers) child.kill('SIGKILL');

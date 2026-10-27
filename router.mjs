@@ -198,42 +198,47 @@ async function pollOne(b) {
   b.pollPeak = b.inflight;
   try {
     const m = await getJson(b, '/metrics');
-    const live = m.live || {};
-    b.healthy = true;
-    b.fails = 0;
-    b.state = live.state || null;
-    b.lastError = null;
+    if (!m || typeof m !== 'object') throw Object.assign(new Error('/metrics answered something other than a json object'), { definite: true });
+    const live = m.live && typeof m.live === 'object' ? m.live : {};
+    const state = typeof live.state === 'string' ? live.state : null;
     b.lastPoll = Date.now();
-    b.slots = Array.isArray(live.slots) ? live.slots : [];
-    b.running = live.running || 0;
-    b.queued = live.queued || 0;
+    b.slots = Array.isArray(live.slots) ? live.slots.filter((x) => x && typeof x === 'object') : [];
+    b.queued = Number(live.queued) || 0;
     // without batch slots strata answers one request at a time and queues the rest
     b.batch = Math.max(1, Number(m.engine?.batch_slots) || 1);
     // requests sent to the engine directly take slots too; a request the router finished while the poll was out
     // counts as its own, and a direct one has to show twice in a row, so one the engine is still wrapping up doesn't
-    const running = Number(live.running ?? (['reading', 'generating'].includes(b.state) ? 1 : 0)) || 0;
+    const running = Number(live.running ?? (['reading', 'generating'].includes(state) ? 1 : 0)) || 0;
+    b.running = running;
     const seen = Math.max(0, running - b.pollPeak);
     b.direct = Math.min(seen, b.directSeen);
     b.directSeen = seen;
     const at = performance.now();
     if (b.busyAt) b.busy += (Math.min(1, running / b.batch) - b.busy) * (1 - 0.5 ** ((at - b.busyAt) / BUSY_HALF_LIFE_MS));
     b.busyAt = at;
-    b.tok_s_mean = live.tok_s_mean ?? null;
-    b.held_tokens = b.slots.reduce((s, x) => s + (x?.held_tokens || 0), 0);
-    b.vram_free_mib = m.engine?.vram_free_mib ?? 0;
-    b.version = m.engine?.version ?? null;
+    b.tok_s_mean = Number.isFinite(live.tok_s_mean) ? live.tok_s_mean : null;
+    b.held_tokens = b.slots.reduce((n, x) => n + (Number(x.held_tokens) || 0), 0);
+    b.vram_free_mib = Number(m.engine?.vram_free_mib) || 0;
+    b.version = typeof m.engine?.version === 'string' ? m.engine.version : null;
     // strata's top-level progress is the newest request's, the only one when it runs without batch slots
     b.current = Object.fromEntries(['phase', 'prompt_tokens', 'prompt_read', 'prompt_total', 'generated', 'max_tokens', 'tok_s', 'elapsed_s'].map((k) => [k, live[k] ?? null]));
     b.hardware = numbers(m.hardware, HARDWARE);
     b.history = { gpu_util: series(m.history?.gpu_util), tok_s: series(m.history?.tok_s) };
     b.recent = recentStats(m.requests);
-    const cache = m.conversation_cache || null;
-    const since = m.totals?.since ?? null;
-    // a new server start, or cache counters starting over (strata restarts a stuck engine itself)
-    const restarted = (b.since != null && since != null && since !== b.since) || (b.cache && cache && cacheEvents(cache) < cacheEvents(b.cache));
+    const cache = m.conversation_cache && typeof m.conversation_cache === 'object' ? m.conversation_cache : null;
+    const since = Number.isFinite(m.totals?.since) ? m.totals.since : null;
+    // the cache is gone after a new server start, when its counters start over (a restarted engine), and while the
+    // model is unloaded, which is also what strata reports while it brings a restarted engine back up
+    const why = b.since != null && since != null && since !== b.since ? 'restarted'
+      : b.cache && cache && cacheEvents(cache) < cacheEvents(b.cache) ? 'restarted its engine'
+      : state === 'unloaded' && b.state !== 'unloaded' ? 'unloaded its model' : null;
     b.since = since;
     b.cache = cache;
-    if (restarted) forgetHomes(b);
+    b.state = state;
+    if (why) forgetHomes(b, why);
+    b.healthy = true;
+    b.fails = 0;
+    b.lastError = null;
     lastHealthyAt = performance.now();
   } catch (err) {
     b.fails++;
@@ -241,6 +246,8 @@ async function pollOne(b) {
     // an answer or a refused connection is final; a timeout may just be an engine busy prefilling
     if (err.definite || err.code === 'ECONNREFUSED' || b.fails >= config.pollFails) {
       b.healthy = false;
+      // what it was doing when it went quiet is no longer known
+      Object.assign(b, { state: null, slots: [], running: 0, queued: 0, direct: 0, directSeen: 0, current: null });
       // requests still waiting for a first token can't tell a long prefill from a dead engine
       for (const flight of b.flights) flight.engineDown();
     }
@@ -259,8 +266,9 @@ const median = (a) => {
 };
 
 // the engine's own account of its last requests: decode and prompt speed, expert cache hits, drafts kept
-function recentStats(reqs) {
-  if (!Array.isArray(reqs) || !reqs.length) return null;
+function recentStats(list) {
+  const reqs = Array.isArray(list) ? list.filter((r) => r && typeof r === 'object') : [];
+  if (!reqs.length) return null;
   const offered = reqs.reduce((n, r) => n + (r.drafts_offered || 0), 0);
   const accepted = reqs.reduce((n, r) => n + (r.drafts_accepted || 0), 0);
   return {
@@ -292,8 +300,8 @@ function activity(b) {
   return rows;
 }
 
-// a restarted engine has an empty cache: its conversations are as cold there as anywhere, so nobody waits for it
-function forgetHomes(b) {
+// an engine that lost its cache: its conversations are as cold there as anywhere, so nobody waits for it
+function forgetHomes(b, why) {
   let n = 0;
   for (const c of convs.values()) {
     if (c.backend !== b.name) continue;
@@ -302,7 +310,7 @@ function forgetHomes(b) {
   }
   b.restarts++;
   stats.restarts++;
-  log(`${b.name} restarted: ${n} conversation(s) lost their cache there`);
+  log(`${b.name} ${why}: ${n} conversation(s) lost their cache there`);
 }
 
 // one loop per engine, so a dead one can't hold up the others' state
@@ -315,7 +323,6 @@ async function pollLoop(b) {
 
 // requests waiting for a slot, in arrival order; claim is the busy home a patient one holds out for
 const queue = new Set();
-const shortWaiting = new Set();
 
 // whoever is woken first takes a freed slot: short requests, and anyone past SHORT_PASS_MS, before the rest
 function wake() {
@@ -393,12 +400,19 @@ function remember(key, conv) {
   while (convs.size > config.maxConversations) convs.delete(convs.keys().next().value);
 }
 
-// how long a busy home is worth waiting for: past this, a cold prefill elsewhere is cheaper
-function patience(conv, home) {
+// an engine's prompt speed: its own account of its recent prompts when it gives one, else what the router measured
+const prefillRate = (b) => b.recent?.prefill_tok_s || b.prefill_tok_s || config.prefillTokS;
+
+// how long a busy home is worth waiting for: past this, reading this request's prompt elsewhere is cheaper; an engine
+// that has to load its model first is no alternative
+function patience(tokens, home) {
   if (!home?.healthy) return 0;
-  const rates = config.backends.filter((b) => b !== home && b.healthy).map((b) => b.prefill_tok_s || config.prefillTokS);
-  return Math.min(config.queueWaitMs, (conv.prompt_tokens / Math.max(config.prefillTokS / 10, ...rates)) * 1000);
+  const rates = config.backends.filter((b) => b !== home && b.healthy && b.state !== 'unloaded').map(prefillRate);
+  return Math.min(config.queueWaitMs, (tokens / Math.max(config.prefillTokS / 10, ...rates)) * 1000);
 }
+
+// tokens in a request, from its size and the bytes per token its conversation's last answer showed
+const estimate = (raw, conv) => Math.round(raw.length * (conv.tokens_per_byte || 0.25));
 
 // streamed turns with a mostly uncached prompt show how fast an engine really prefills
 function learnPrefill(b, u, firstTokenMs) {
@@ -408,38 +422,54 @@ function learnPrefill(b, u, firstTokenMs) {
   b.prefill_tok_s = Math.round(b.prefill_tok_s ? 0.7 * b.prefill_tok_s + 0.3 * rate : rate);
 }
 
+// a short request waiting for the slot a long one is about to take goes first, as it gives it back quickly; only
+// within SHORT_PASS_MS of the long one's wait, so it can't starve
+const stepAside = (me, b) => !me.short && performance.now() - me.t0 < SHORT_PASS_MS &&
+  [...queue].some((w) => w !== me && w.short && !w.isGone() && w.exclude !== b && (!w.claim || w.claim === b));
+
+// let woken waiters take their turn before carrying on
+const yieldTurn = () => new Promise((resolve) => setImmediate(resolve));
+
 // the backend it returns already has a slot reserved for the caller
-async function pick(conv, isGone, exclude = null, short = false) {
+async function pick(conv, isGone, { exclude = null, short = false, tokens = 0 } = {}) {
   const t0 = performance.now();
-  const me = { claim: null, isGone, t0, short, wake() {} };
+  const me = { claim: null, isGone, t0, short, exclude, wake() {} };
   let waited = false;
+  // a long request steps aside once per wake-up; if the short one doesn't take the slot, it goes ahead
+  let yielded = false;
   try {
     for (;;) {
       if (isGone() || draining) return {};
       const elapsed = performance.now() - t0;
       // a home that unloaded its model has lost the conversation's KV anyway
       const home = config.backends.find((b) => b.name === conv.backend && b !== exclude && b.state !== 'unloaded');
-      if (home && capacity(home)) return { b: reserve(home), waited };
+      if (home && capacity(home)) {
+        if (yielded || !stepAside(me, home)) return { b: reserve(home), waited };
+        yielded = true;
+        wake();
+        await yieldTurn();
+        continue;
+      }
 
       const healthy = config.backends.filter((b) => b.healthy && b !== exclude);
       // a retry has nowhere to go; otherwise give the next poll a chance before failing
       if (!healthy.length && (exclude || performance.now() - lastHealthyAt >= Math.min(config.queueWaitMs, config.pollMs + 1000))) return { waited };
 
-      // a short request waiting behind long ones takes the next freed slot, as long as it does not
-      // starve: a long request only steps aside for SHORT_PASS_MS, then arrival order rules again
-      if (!me.short && elapsed < SHORT_PASS_MS && shortWaiting.size) {
-        waited = true;
-        queue.add(me);
-        await sleep(200);
-        continue;
-      }
-
-      const hold = patience(conv, home);
+      const hold = patience(tokens, home);
       me.claim = elapsed < hold ? home : null;
       if (!me.claim) {
+        // an engine that has to load its model first (about 90 s) only takes work when no loaded one is up
+        const loaded = healthy.filter((b) => b.state !== 'unloaded');
         // claims shield a waiting conversation's home from newcomers, but only briefly: past that, arrival order
-        const open = healthy.filter((b) => capacity(b) && (elapsed >= CLAIM_HOLD_MS || freeSlots(b) > claimed(b)));
-        if (open.length) return { b: reserve(best(open)), waited };
+        const open = (loaded.length ? loaded : healthy).filter((b) => capacity(b) && (elapsed >= CLAIM_HOLD_MS || freeSlots(b) > claimed(b)));
+        if (open.length) {
+          const b = best(open);
+          if (yielded || !stepAside(me, b)) return { b: reserve(b), waited };
+          yielded = true;
+          wake();
+          await yieldTurn();
+          continue;
+        }
       }
       // everything saturated for too long: let an engine queue it, home first
       if (healthy.length && elapsed >= config.queueWaitMs) {
@@ -447,7 +477,6 @@ async function pick(conv, isGone, exclude = null, short = false) {
       }
       waited = true;
       queue.add(me);
-      if (me.short) shortWaiting.add(me);
       await new Promise((resolve) => {
         const timer = setTimeout(resolve, Math.max(1, Math.min(1000, (me.claim ? hold : config.queueWaitMs) - elapsed)));
         me.wake = () => {
@@ -455,9 +484,9 @@ async function pick(conv, isGone, exclude = null, short = false) {
           resolve();
         };
       });
+      yielded = false;
     }
   } finally {
-    shortWaiting.delete(me);
     // a claim going away can open its slot to the others
     if (queue.delete(me) && me.claim) wake();
   }
@@ -482,6 +511,9 @@ function generated(o) {
   return typeof o?.type === 'string' && /[._]delta$/.test(o.type) && o.type !== 'message_delta';
 }
 
+// the last event of an anthropic or responses stream; openai streams end with data: [DONE]
+const FINAL = new Set(['message_stop', 'error', 'response.completed', 'response.incomplete', 'response.failed']);
+
 function usageTap(sse) {
   const dec = new StringDecoder('utf8');
   let buf = '';
@@ -503,7 +535,7 @@ function usageTap(sse) {
       return;
     }
     if (!tap.firstTokenAt && generated(o)) tap.firstTokenAt = performance.now();
-    if (o?.type === 'message_stop' || o?.type === 'response.completed') tap.complete = true;
+    if (FINAL.has(o?.type)) tap.complete = true;
     take(o);
   };
   const tap = {
@@ -592,6 +624,9 @@ function forward(b, req, url, payload, res, { hold5xx = false, signal }) {
     let responded = false;
     let tap = null;
     let connectTimer;
+    let stallTimer;
+    // the chunk with the stream's final event has left the router
+    let delivered = false;
 
     // only an answer that hasn't reached the client can move; a started one waits for READ_TIMEOUT
     const flight = {
@@ -603,6 +638,7 @@ function forward(b, req, url, payload, res, { hold5xx = false, signal }) {
       if (settled) return;
       settled = true;
       clearTimeout(connectTimer);
+      clearTimeout(stallTimer);
       b.flights.delete(flight);
       signal.removeEventListener('abort', onClientGone);
       resolve({ elapsed: Math.round(performance.now() - t0), ...result });
@@ -621,11 +657,13 @@ function forward(b, req, url, payload, res, { hold5xx = false, signal }) {
     };
     const onClientGone = () => {
       // the openai sdk hangs up as soon as it reads [DONE], before the engine has closed the stream
-      if (tap?.complete) {
+      if (delivered) {
         done({ ok: true, status: up.res.statusCode, usage: tap.end(), firstTokenMs: tap.firstTokenAt && tap.firstTokenAt - t0 });
         return up.destroy();
       }
-      up.destroy(new Error('client went away'));
+      // settled here: the engine may have finished already while the answer waited on this client
+      up.destroy();
+      fail(new Error('client went away'));
     };
     // silence is fine while the engine reports work: long prefills and non-streamed answers say nothing for minutes
     const onSilence = (socket) => {
@@ -656,10 +694,21 @@ function forward(b, req, url, payload, res, { hold5xx = false, signal }) {
       }
       tap = usageTap(/event-stream/.test(r.headers['content-type'] || ''));
       r.on('data', (c) => {
+        const before = tap.complete;
         tap.write(c);
-        if (!res.write(c)) {
+        const final = !before && tap.complete;
+        if (!res.write(c, final ? (err) => { delivered = !err; } : undefined)) {
           r.pause();
-          res.once('drain', () => r.resume());
+          // a client that stops reading holds its slot for READ_TIMEOUT at most
+          stallTimer = setTimeout(() => {
+            res.destroy();
+            up.destroy();
+            done({ ok: false, retryable: false, aborted: true, error: 'client stopped reading' });
+          }, config.readTimeoutMs);
+          res.once('drain', () => {
+            clearTimeout(stallTimer);
+            r.resume();
+          });
         }
       });
       r.on('end', () => {
@@ -780,10 +829,11 @@ async function handleChat(req, res, raw, url) {
   const client = watchClient(req, res);
   const gone = () => client.signal.aborted;
   const ev = track(key, conv);
-  const short = raw.length / 4 < config.shortPrompt;
+  const tokens = estimate(raw, conv);
+  const short = tokens < config.shortPrompt;
   const slot = async (exclude) => {
     const t = performance.now();
-    const picked = await pick(conv, gone, exclude, short);
+    const picked = await pick(conv, gone, { exclude, short, tokens });
     ev.wait_ms += performance.now() - t;
     ev.queued ||= Boolean(picked.waited);
     ev.overflow ||= Boolean(picked.overflow);
@@ -860,8 +910,8 @@ async function handleChat(req, res, raw, url) {
       const u = out.usage;
       if (out.firstTokenMs) {
         ev.engine_ttft_ms = Math.round(out.firstTokenMs);
-        const fresh = u ? u.prompt - u.cached : raw.length / 4;
-        ev.expected_ttft_ms = Math.round((fresh / (served.prefill_tok_s || config.prefillTokS)) * 1000);
+        const fresh = u ? u.prompt - u.cached : tokens;
+        ev.expected_ttft_ms = Math.round((fresh / prefillRate(served)) * 1000);
         // after an overflow the time to first token includes the engine's own queue
         ev.slow = !overflow && ev.engine_ttft_ms > config.slowFirstTokenMs && ev.engine_ttft_ms > 3 * ev.expected_ttft_ms;
         if (ev.slow) {
@@ -874,10 +924,12 @@ async function handleChat(req, res, raw, url) {
         stats.prompt_tokens += u.prompt;
         stats.completion_tokens += u.completion;
         stats.cached_tokens += u.cached;
-        if (out.firstTokenMs && !overflow && !ev.slow) learnPrefill(served, u, out.firstTokenMs);
+        // a stall only counts as one against the engine's own figures; judged against a guess, it may just be slow
+        if (out.firstTokenMs && !overflow && !(ev.slow && served.recent?.prefill_tok_s)) learnPrefill(served, u, out.firstTokenMs);
       }
       // without usage, guess the prompt from the request size so patience still works
-      conv.prompt_tokens = u?.prompt || Math.round(raw.length / 4);
+      conv.prompt_tokens = u?.prompt || tokens;
+      if (u?.prompt && raw.length) conv.tokens_per_byte = u.prompt / raw.length;
       const status = out.status === 200 ? '' : ` status=${out.status}`;
       log(`${served.name} key=${key} turns=${conv.turns}${status} prompt=${u?.prompt ?? '-'} cached=${u?.cached ?? '-'} out=${u?.completion ?? '-'} ${out.elapsed}ms`);
     } else if (out.aborted) {
@@ -1004,12 +1056,22 @@ function page(res) {
   res.end(DASHBOARD);
 }
 
+// homes, and what each engine looked like when they were saved: one that restarted meanwhile has lost them
 function loadState() {
   if (!config.stateFile) return;
   try {
+    const saved = JSON.parse(fs.readFileSync(config.stateFile, 'utf8'));
+    const list = Array.isArray(saved) ? saved : saved?.conversations || [];
     const names = new Set(config.backends.map((b) => b.name));
-    for (const [key, c] of JSON.parse(fs.readFileSync(config.stateFile, 'utf8'))) {
-      if (names.has(c?.backend)) remember(key, { backend: c.backend, turns: c.turns || 0, prompt_tokens: c.prompt_tokens || 0, first: c.first, model: c.model, last: c.last || null, migrations: c.migrations || 0 });
+    for (const [key, c] of list) {
+      if (names.has(c?.backend)) remember(key, { backend: c.backend, turns: c.turns || 0, prompt_tokens: c.prompt_tokens || 0, tokens_per_byte: c.tokens_per_byte || null, first: c.first, model: c.model, last: c.last || null, migrations: c.migrations || 0 });
+    }
+    for (const b of config.backends) {
+      const e = saved?.engines?.[b.name];
+      if (!e) continue;
+      b.since = Number.isFinite(e.since) ? e.since : null;
+      b.cache = e.cache && typeof e.cache === 'object' ? e.cache : null;
+      b.state = typeof e.state === 'string' ? e.state : null;
     }
     log(`restored ${convs.size} conversation homes from ${config.stateFile}`);
   } catch (err) {
@@ -1020,7 +1082,8 @@ function loadState() {
 function saveState() {
   if (!config.stateFile) return;
   try {
-    fs.writeFileSync(`${config.stateFile}.tmp`, JSON.stringify([...convs]));
+    const engines = Object.fromEntries(config.backends.map((b) => [b.name, { since: b.since, cache: b.cache && { parks: b.cache.parks || 0, restores: b.cache.restores || 0 }, state: b.state }]));
+    fs.writeFileSync(`${config.stateFile}.tmp`, JSON.stringify({ conversations: [...convs], engines }));
     fs.renameSync(`${config.stateFile}.tmp`, config.stateFile);
   } catch (err) {
     console.error(`state file ${config.stateFile}: ${err.message}`);
@@ -1361,7 +1424,7 @@ const KINDS = {
 };
 const FLAGS = {
   slow: ['warn', 'serious', 'The engine took far longer to start answering than the uncached part of the prompt needs, so it may have stalled.'],
-  restarts: ['retry', 'warning', 'An engine restarted, so its cache is empty: its conversations start cold and go wherever there is room.'],
+  restarts: ['retry', 'warning', 'An engine lost its cache (it restarted, or unloaded its model): its conversations start cold and go wherever there is room.'],
 };
 const COUNTERS = [
   ['requests', 'Requests', null, 'Requests the router placed on an engine since it started.'],
