@@ -8,6 +8,9 @@
   "license": "MIT",
   "scripts": {
     "start": "node router.mjs",
-    "test": "node test/test.mjs"
+    "test": "node test/test.mjs",
+    "test-shim": "node test/shim-test.mjs",
+    "repro": "node test/avalon-repro.mjs",
+    "soak": "node test/avalon-soak.mjs"
   }
 }

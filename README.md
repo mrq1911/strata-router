@@ -229,7 +229,57 @@ With keyed engines, mount the key file and add `-e STRATA_API_KEY_FILE=/run/secr
 
 ```bash
 node test/test.mjs           # stickiness, spill, failover, queueing, failure modes
+node test/shim-test.mjs      # the avalon shim against a fake llama.cpp engine
 node test/mock-engines.mjs   # two fake engines on :9101 and :9102, to poke at by hand
+```
+
+## engines that are not strata: avalon-shim
+
+[Avalon](https://github.com/freriadoc/Avalon) (a llama.cpp fork) speaks the OpenAI endpoints the router
+forwards, but it has no `/metrics` in the shape the router reads: it only reports a start time, slots and
+spec-decode counters, and nothing about the GPU. `avalon-shim.mjs` sits in front of one such engine, relays
+every request untouched, and answers `GET /metrics` itself:
+
+```bash
+AVALON=127.0.0.1:8080 PORT=8081 node avalon-shim.mjs
+STRATA_BACKENDS="avalon=127.0.0.1:8081,strata=127.0.0.1:8080" node router.mjs
+```
+
+| env | default | meaning |
+|---|---|---|
+| `AVALON` | `127.0.0.1:8080` | the engine it fronts (`host:port`) |
+| `PORT` | `8081` | the port the router talks to |
+| `SAMPLE_MS` | `2000` | how often to read the GPU and the throughput gauges into the history |
+| `FRESH_MS` | `600` | how long an engine read (props/slots/metrics) may be reused |
+| `PROPS_MS` | `10000` | how often to re-read `/props`, which is how a restart is noticed |
+| `GPU_INDEX` | `0` | which GPU `nvidia-smi` reports |
+| `NVIDIA_SMI` | `/usr/bin/nvidia-smi` | the binary used for GPU readings |
+| `AVALON_API_KEY_FILE` | none | file with the engine's API key, sent on the shim's own reads |
+
+what it fills in:
+
+- **state and slots** from `GET /slots`: idle slots keep the tokens they hold, busy ones are matched to the
+  request the shim sent, so the dashboard shows the prompt being read and the answer being written
+- **speeds** from the `timings` block on each finished answer (`prompt_ms`, `predicted_ms`, `draft_n`),
+  which llama.cpp only puts on streamed answers: the shim adds a matching `usage` block to that chunk, so
+  clients and the router count tokens the same way as with a non-streamed reply
+- **hardware** from `nvidia-smi` and `/proc` on the machine the shim runs on; put it on the GPU box
+- **restarts** from a field in `/props` that changes when the process starts, since llama.cpp reports no
+  start time; the router then drops the conversations that lost their cache
+- **reasoning effort**: avalon's qwen3.8 template only knows `xhigh`/`medium`/`low` and raises on the
+  names clients actually send (`high`, `minimal`, `max`, `none`), so the shim rewrites them in the chat
+  body before relaying (`high`/`max` → `xhigh`, `minimal` → `low`, `none` → `enable_thinking: false`).
+  Without that the engine answers 500 on a perfectly good request
+
+what stays empty because avalon does not have it: the conversation cache's parked/restores/evictions, expert
+cache hits and PCIe share. Everything else the router needs for sticky routing works.
+
+Start the shim next to the engine, on the same box:
+
+```bash
+sudo install -Dm644 avalon-shim.mjs /opt/avalon-shim/avalon-shim.mjs
+sudo cp systemd/avalon-shim.service /etc/systemd/system/
+sudo systemctl enable --now avalon-shim
 ```
 
 ## pointing a client at it

@@ -1,0 +1,14 @@
+[Unit]
+Description=Avalon metrics shim: makes a llama.cpp server routable by strata-router
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node /opt/avalon-shim/avalon-shim.mjs
+Environment=AVALON=127.0.0.1:8080
+Environment=PORT=8081
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
