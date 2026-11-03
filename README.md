@@ -282,6 +282,50 @@ sudo cp systemd/avalon-shim.service /etc/systemd/system/
 sudo systemctl enable --now avalon-shim
 ```
 
+## engines that are not strata: sglang-shim
+
+SGLang (e.g. trellis-serve's EXL3 offload images) has no JSON `/metrics` either: its own is prometheus text,
+and only with `--enable-metrics`. `sglang-shim.mjs` does the same job as avalon-shim from what SGLang does have:
+
+```bash
+SGLANG=127.0.0.1:30000 PORT=30001 node sglang-shim.mjs
+STRATA_BACKENDS="sglang=127.0.0.1:30001,strata=127.0.0.1:8080" node router.mjs
+```
+
+| env | default | meaning |
+|---|---|---|
+| `SGLANG` | `127.0.0.1:30000` | the engine it fronts (`host:port`) |
+| `PORT` | `30001` | the port the router talks to |
+| `SAMPLE_MS` | `2000` | how often to read the GPU and the throughput gauges into the history |
+| `FRESH_MS` | `600` | how long an engine read (`/v1/loads`) may be reused |
+| `INFO_MS` | `10000` | how often to re-read `/server_info`, which is how a restart is noticed |
+| `GPU_INDEX` | `0` | which GPU `nvidia-smi` reports |
+| `NVIDIA_SMI` | `/usr/bin/nvidia-smi` | the binary used for GPU readings |
+| `SGLANG_API_KEY_FILE` | none | file with the engine's API key, sent on the shim's own reads |
+
+what it fills in:
+
+- **state, slots and queue** from `/v1/loads` (running and waiting requests, tokens in use, decode throughput)
+  and `max_running_requests` from `/server_info`
+- **speeds** from the usage block of each answer. Speculative decoding streams several tokens per chunk, so
+  chunks are no count; SGLang streams usage only when asked, so the shim sets `stream_options.include_usage` on
+  streamed answers, and they end with usage as strata's do
+- **restarts** from `/server_info`'s `startup_time`, the load and graph-capture times this process measured,
+  which differ on every start
+- **reasoning effort**: the qwen3.8 template raises on anything but `xhigh`/`medium`/`low` (SGLang answers 400),
+  so effort levels are rewritten as avalon-shim does
+- **hardware** from `nvidia-smi` and `/proc` on the machine the shim runs on
+
+what stays empty: the conversation cache's parks/restores, expert cache hits and PCIe share, per-request draft
+counts (the mean accept length is in `engine.accept_length`), and cached prompt tokens unless SGLang runs with
+`--enable-cache-report`.
+
+```bash
+sudo install -Dm644 sglang-shim.mjs /opt/sglang-shim/sglang-shim.mjs
+sudo cp systemd/sglang-shim.service /etc/systemd/system/
+sudo systemctl enable --now sglang-shim
+```
+
 ## pointing a client at it
 
 pi (`~/.pi/agent/models.json`):

@@ -1,0 +1,14 @@
+[Unit]
+Description=SGLang metrics shim: makes an SGLang server routable by strata-router
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node /opt/sglang-shim/sglang-shim.mjs
+Environment=SGLANG=127.0.0.1:30000
+Environment=PORT=30001
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

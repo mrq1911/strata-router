@@ -10,6 +10,7 @@
     "start": "node router.mjs",
     "test": "node test/test.mjs",
     "test-shim": "node test/shim-test.mjs",
+    "test-sglang-shim": "node test/sglang-shim-test.mjs",
     "repro": "node test/avalon-repro.mjs",
     "soak": "node test/avalon-soak.mjs"
   }
