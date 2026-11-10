@@ -30,12 +30,16 @@ const config = {
   slowFirstTokenMs: num('SLOW_FIRST_TOKEN', 10000, { min: 1 }),
   shutdownGraceMs: num('SHUTDOWN_GRACE', 30000),
   passthrough: new Set((process.env.PASSTHROUGH || '').split(',').map((s) => s.trim()).filter(Boolean)),
+  prefer: (process.env.PREFER_BACKEND || '').trim(),
   stateFile: process.env.STATE_FILE || '',
   apiKey: readKey(process.env.STRATA_API_KEY_FILE),
   verbose: process.env.LOG !== 'off',
 };
 
 for (const p of config.passthrough) if (!p.startsWith('/')) problems.push(`PASSTHROUGH entry "${p}": expected a path like /v1/vram`);
+if (config.prefer && !config.backends.some((b) => b.name === config.prefer)) {
+  problems.push(`PREFER_BACKEND="${config.prefer}": not one of ${config.backends.map((b) => b.name).join(', ') || 'no engines'}`);
+}
 if (config.stateFile) {
   try {
     fs.accessSync(dirname(config.stateFile), fs.constants.W_OK);
@@ -106,6 +110,7 @@ function parseBackends(spec) {
       prefill_tok_s: null,
       held_tokens: 0,
       vram_free_mib: 0,
+      images: false,
       cache: null,
       current: null,
       hardware: null,
@@ -219,6 +224,8 @@ async function pollOne(b) {
     b.tok_s_mean = Number.isFinite(live.tok_s_mean) ? live.tok_s_mean : null;
     b.held_tokens = b.slots.reduce((n, x) => n + (Number(x.held_tokens) || 0), 0);
     b.vram_free_mib = Number(m.engine?.vram_free_mib) || 0;
+    // an engine that says nothing about pictures has no vision encoder
+    b.images = m.engine?.images === true;
     b.version = typeof m.engine?.version === 'string' ? m.engine.version : null;
     // strata's top-level progress is the newest request's, the only one when it runs without batch slots
     b.current = Object.fromEntries(['phase', 'prompt_tokens', 'prompt_read', 'prompt_total', 'generated', 'max_tokens', 'tok_s', 'elapsed_s'].map((k) => [k, live[k] ?? null]));
@@ -394,6 +401,19 @@ function conversationKey(body) {
   return createHash('sha256').update(`${body.model || 'default'}|${system}|${first}`).digest('hex').slice(0, 16);
 }
 
+// openai chat (image_url), the responses api (input_image) and anthropic (image, also inside a tool_result)
+const IMAGE_PARTS = new Set(['image_url', 'input_image', 'image']);
+
+function hasImage(x, depth = 0) {
+  if (!x || typeof x !== 'object' || depth > 6) return false;
+  if (Array.isArray(x)) return x.some((v) => hasImage(v, depth + 1));
+  if (IMAGE_PARTS.has(x.type)) return true;
+  return hasImage(x.content, depth + 1);
+}
+
+// the whole history is sent every turn, so a conversation that ever had a picture keeps needing a vision engine
+const wantsVision = (body) => hasImage(body.messages) || hasImage(body.input);
+
 function remember(key, conv) {
   convs.delete(key);
   convs.set(key, conv);
@@ -405,9 +425,9 @@ const prefillRate = (b) => b.recent?.prefill_tok_s || b.prefill_tok_s || config.
 
 // how long a busy home is worth waiting for: past this, reading this request's prompt elsewhere is cheaper; an engine
 // that has to load its model first is no alternative
-function patience(tokens, home) {
+function patience(tokens, home, vision = false) {
   if (!home?.healthy) return 0;
-  const rates = config.backends.filter((b) => b !== home && b.healthy && b.state !== 'unloaded').map(prefillRate);
+  const rates = config.backends.filter((b) => b !== home && b.healthy && b.state !== 'unloaded' && (!vision || b.images)).map(prefillRate);
   return Math.min(config.queueWaitMs, (tokens / Math.max(config.prefillTokS / 10, ...rates)) * 1000);
 }
 
@@ -430,10 +450,21 @@ const stepAside = (me, b) => !me.short && performance.now() - me.t0 < SHORT_PASS
 // let woken waiters take their turn before carrying on
 const yieldTurn = () => new Promise((resolve) => setImmediate(resolve));
 
+// the engine a request should try first: the header beats PREFER_BACKEND, and an engine that is down or has
+// unloaded its model is not available, so the caller falls back to the usual sticky routing
+function wantEngine(name, vision) {
+  const want = String(name || '').trim();
+  if (!want) return null;
+  const b = config.backends.find((x) => x.name === want);
+  return b && b.healthy && b.state !== 'unloaded' && (!vision || b.images) ? b : null;
+}
+
 // the backend it returns already has a slot reserved for the caller
-async function pick(conv, isGone, { exclude = null, short = false, tokens = 0 } = {}) {
+async function pick(conv, isGone, { exclude = null, short = false, tokens = 0, vision = false, prefer = null } = {}) {
   const t0 = performance.now();
   const me = { claim: null, isGone, t0, short, exclude, wake() {} };
+  // a request with pictures only goes to an engine that reads them
+  const fits = (b) => b !== exclude && (!vision || b.images);
   let waited = false;
   // a long request steps aside once per wake-up; if the short one doesn't take the slot, it goes ahead
   let yielded = false;
@@ -441,8 +472,25 @@ async function pick(conv, isGone, { exclude = null, short = false, tokens = 0 } 
     for (;;) {
       if (isGone() || draining) return {};
       const elapsed = performance.now() - t0;
+      // a preferred engine keeps the request instead of handing it to another box
+      const want = wantEngine(prefer, vision);
+      if (want && want !== exclude) {
+        if (capacity(want)) return { b: reserve(want), waited, preferred: true };
+        // alive but full: hold it here for MAX_QUEUE_WAIT, then let that engine queue it itself
+        if (elapsed >= config.queueWaitMs) return { b: reserve(want), waited, overflow: true, preferred: true };
+        waited = true;
+        queue.add(me);
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, Math.max(1, Math.min(1000, config.queueWaitMs - elapsed)));
+          me.wake = () => {
+            clearTimeout(timer);
+            resolve();
+          };
+        });
+        continue;
+      }
       // a home that unloaded its model has lost the conversation's KV anyway
-      const home = config.backends.find((b) => b.name === conv.backend && b !== exclude && b.state !== 'unloaded');
+      const home = config.backends.find((b) => b.name === conv.backend && fits(b) && b.state !== 'unloaded');
       if (home && capacity(home)) {
         if (yielded || !stepAside(me, home)) return { b: reserve(home), waited };
         yielded = true;
@@ -451,11 +499,13 @@ async function pick(conv, isGone, { exclude = null, short = false, tokens = 0 } 
         continue;
       }
 
-      const healthy = config.backends.filter((b) => b.healthy && b !== exclude);
-      // a retry has nowhere to go; otherwise give the next poll a chance before failing
-      if (!healthy.length && (exclude || performance.now() - lastHealthyAt >= Math.min(config.queueWaitMs, config.pollMs + 1000))) return { waited };
+      const healthy = config.backends.filter((b) => b.healthy && fits(b));
+      // a retry has nowhere to go; otherwise give the next poll a chance before failing. text engines keep
+      // lastHealthyAt fresh, so a request with pictures counts from its own arrival
+      const quiet = vision ? elapsed : performance.now() - lastHealthyAt;
+      if (!healthy.length && (exclude || quiet >= Math.min(config.queueWaitMs, config.pollMs + 1000))) return { waited };
 
-      const hold = patience(tokens, home);
+      const hold = patience(tokens, home, vision);
       me.claim = elapsed < hold ? home : null;
       if (!me.claim) {
         // an engine that has to load its model first (about 90 s) only takes work when no loaded one is up
@@ -774,6 +824,7 @@ function track(key, conv) {
     engine_ttft_ms: null,
     expected_ttft_ms: null,
     slow: false,
+    vision: false,
   };
   live.add(ev);
   return ev;
@@ -831,9 +882,13 @@ async function handleChat(req, res, raw, url) {
   const ev = track(key, conv);
   const tokens = estimate(raw, conv);
   const short = tokens < config.shortPrompt;
+  const vision = wantsVision(body);
+  ev.vision = vision;
+  const prefer = String(req.headers['x-strata-prefer'] || config.prefer || '').trim() || null;
+  ev.prefer = prefer;
   const slot = async (exclude) => {
     const t = performance.now();
-    const picked = await pick(conv, gone, { exclude, short, tokens });
+    const picked = await pick(conv, gone, { exclude, short, tokens, vision, prefer });
     ev.wait_ms += performance.now() - t;
     ev.queued ||= Boolean(picked.waited);
     ev.overflow ||= Boolean(picked.overflow);
@@ -851,11 +906,11 @@ async function handleChat(req, res, raw, url) {
         ev.kind = 'gone';
         return;
       }
-      ev.error = draining ? 'router is shutting down' : 'no healthy backend';
+      ev.error = draining ? 'router is shutting down' : vision ? 'no healthy backend with vision' : 'no healthy backend';
       if (draining) return send(res, 503, { error: ev.error });
       return send(res, 503, {
         error: ev.error,
-        backends: config.backends.map((x) => ({ name: x.name, healthy: x.healthy, error: x.lastError })),
+        backends: config.backends.map((x) => ({ name: x.name, healthy: x.healthy, images: x.images, error: x.lastError })),
       });
     }
     stats.requests++;
@@ -986,6 +1041,7 @@ function handleGet(res, path, query) {
     return send(res, 200, {
       stats,
       now: Date.now(),
+      preferred: config.prefer || null,
       backends: config.backends.map((b) => ({
         name: b.name,
         host: addr(b),
@@ -1001,6 +1057,7 @@ function handleGet(res, path, query) {
         tok_s_mean: b.tok_s_mean,
         prefill_tok_s: b.prefill_tok_s,
         vram_free_mib: b.vram_free_mib,
+        images: b.images,
         parked: b.cache?.parked ?? 0,
         cache_budget_mib: b.cache?.budget_mib ?? 0,
         cache_slots: b.cache?.slots ?? null,
@@ -1277,6 +1334,10 @@ main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(540px, 700px)
 .badges .pill { flex: none; }
 .one { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .down .tiles, .down .slots, .down .convs { opacity: .55; }
+.offline { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px; }
+.offline .mini { flex: 0 1 320px; min-width: 0; padding: 8px 12px; }
+.mini h3 { font-size: 13px; }
+.mini .meta { font-size: 12px; margin-top: 2px; }
 .meta.err { color: var(--critical); }
 .slots { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 6px; margin: 12px 0 6px; }
 .slot { display: grid; grid-template-rows: 18px 18px 8px; align-content: start; height: 62px; min-width: 0; overflow: hidden; padding: 7px 9px; border-radius: 8px; border: 1px dashed var(--grid); color: var(--muted); font-size: 12px; }
@@ -1636,8 +1697,10 @@ function render() {
   // a first turn in progress already builds its kv on the engine serving it
   for (const c of convs) (homes.get(c.backend || serving.get(c.key)) || homeless).push(c);
   const top = Math.max(1, ...convs.map((c) => c.prompt_tokens));
-  const cards = st.backends.map((b) => engine(b, homes.get(b.name), active, top));
+  const cards = st.backends.filter((b) => b.healthy).map((b) => engine(b, homes.get(b.name), active, top));
   if (homeless.length) cards.push(h('article', { class: 'card' }, h('h3', null, 'No home engine'), convList('', homeless, active, top)));
+  const down = st.backends.filter((b) => !b.healthy);
+  if (down.length) cards.push(h('div', { class: 'offline' }, down.map((b) => offline(b, homes.get(b.name)))));
   $('engines').replaceChildren(...cards);
 
   $('live').replaceChildren(...live.slice().reverse().map(liveRow));
@@ -1679,6 +1742,7 @@ function timeline(st) {
   let y = 0, n = 0;
   const laneKids = [];
   for (const [name, items] of lanes) {
+    if (!items.length) continue;   // nothing ran on this engine in the window: no row
     const b = st.backends.find((x) => x.name === name);
     items.sort((m, k) => m.t0 - k.t0);
     // a fixed number of rows per lane, so the page below doesn't move; past that, bars share the row that frees first
@@ -1707,9 +1771,10 @@ function timeline(st) {
         name && s('rect', { x: xs, y: top, width: Math.max(3, x1 - xs), height: BAR, rx: 2.5, style: { fill: color(it.key), stroke: tone ? 'var(--' + tone + ')' : null, strokeWidth: tone ? 1.5 : null } }),
       ));
     }
-    y += Math.max(lh, 34) + 6;
+      y += Math.max(lh, 34) + 6;
   }
-  const H = y + AXIS - 6;
+  if (!n) laneKids.push(s('text', { class: 'lane-name', x: LW, y: 20 }, 'nothing ran in this window'));
+  const H = Math.max(y, 34) + AXIS - 6;
   const step = tickStep(span);
   for (let t = Math.ceil(start / step) * step; t <= end; t += step) {
     kids.unshift(s('line', { class: 'gridline', x1: X(t), x2: X(t), y1: 0, y2: H - AXIS + 2 }));
@@ -1718,7 +1783,8 @@ function timeline(st) {
   kids.push(s('line', { class: 'now', x1: X(end), x2: X(end), y1: 0, y2: H - AXIS + 2 }));
   const svg = s('svg', { class: 'tl', width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': 'Requests per engine over the last ' + dur(span) }, laneKids, kids);
   box.replaceChildren(svg);
-  $('tl-sub').textContent = '· ' + n + ' request' + (n === 1 ? '' : 's') + ' in the last ' + dur(span) + ' · hover one to trace its conversation';
+  $('tl-sub').textContent = '· ' + n + ' request' + (n === 1 ? '' : 's') + ' in the last ' + dur(span) +
+    (st.preferred ? ' · prefers ' + st.preferred : '') + ' · hover one to trace its conversation';
 }
 
 function tip(it) {
@@ -1729,6 +1795,7 @@ function tip(it) {
   if (e.queued) parts.push('waited ' + dur(e.wait_ms));
   if (e.ttft_ms != null) parts.push('first token ' + dur(e.ttft_ms));
   parts.push('total ' + dur(e.ms));
+  if (e.prefer) parts.push(e.backend === e.prefer ? 'preferred ' + e.prefer : 'preferred ' + e.prefer + ', it was not available');
   if (e.prompt_tokens) parts.push(toks(e.prompt_tokens) + ' prompt tokens, ' + Math.round((100 * e.cached_tokens) / e.prompt_tokens) + '% cached');
   if (e.slow) parts.push('slow: ' + dur(e.engine_ttft_ms) + ' at the engine, about ' + dur(e.expected_ttft_ms) + ' expected');
   if (e.error) parts.push(e.error);
@@ -1796,6 +1863,17 @@ function hardware(b) {
 // a line that never wraps: what doesn't fit is cut, and the whole text is in its tooltip
 const oneLine = (cls, text) => h('div', { class: cls + ' one', 'data-tip': text }, text);
 
+// an engine that is down gets one small card below the others: why, and the conversations still at home there
+function offline(b, list) {
+  const why = b.lastError || 'not answering polls';
+  const homes = list?.length ? list.length + ' conversation' + (list.length > 1 ? 's' : '') + ' at home here' : null;
+  return h('article', { class: 'card down mini' },
+    h('div', { class: 'head' },
+      h('div', { class: 'title' }, h('h3', null, b.name), b.images && h('span', { class: 'tag' }, 'vision')),
+      h('span', { class: 'pill', 'data-tip': why }, icon('failed', 'critical'), 'Down')),
+    oneLine('meta err', [b.host, why, homes].filter(Boolean).join(' · ')));
+}
+
 function engine(b, list, active, top) {
   const [ic, tone, word] = !b.healthy ? ['failed', 'critical', 'Down'] : b.state === 'unloaded' ? ['warn', 'warning', 'Model unloaded'] : b.poll_fails ? ['warn', 'warning', b.poll_fails + ' failed poll' + (b.poll_fails > 1 ? 's' : '')] : ['sticky', 'good', 'Healthy'];
   const rec = b.recent || {};
@@ -1824,7 +1902,8 @@ function engine(b, list, active, top) {
     b.claimed > 0 && h('span', { class: 'pill', 'data-tip': 'Conversations waiting for this engine because it holds their cache; for a moment they keep its next free slot from newcomers.' }, icon('queued', 'warning'), b.claimed + ' waiting'),
   ].filter(Boolean);
   return h('article', { class: b.healthy ? 'card' : 'card down' },
-    h('div', { class: 'head' }, h('div', { class: 'title' }, h('h3', null, b.name), b.version && h('span', { class: 'tag', 'data-tip': 'Engine version' }, b.version)),
+    h('div', { class: 'head' }, h('div', { class: 'title' }, h('h3', null, b.name), b.version && h('span', { class: 'tag', 'data-tip': 'Engine version' }, b.version),
+        b.images && h('span', { class: 'tag', 'data-tip': 'Reads pictures: requests with images only go to engines like this one' }, 'vision')),
       h('div', { class: 'badges' }, badges, h('span', { class: 'pill', 'data-tip': b.lastError || null }, icon(ic, tone), word))),
     b.lastError
       ? oneLine('meta err', b.lastError)
@@ -1884,7 +1963,7 @@ function row(e) {
     h('td', { 'data-tip': explain(kind) }, icon(kind, tone), ' ' + (kind === 'failed' && e.status ? 'failed ' + e.status : kind)),
     h('td', { class: 'key', title: e.key }, swatch(e.key), e.key.slice(0, 8)),
     h('td', { class: 'r c-turn' }, e.turn),
-    h('td', { 'data-tip': route(e) }, route(e)),
+    h('td', { 'data-tip': route(e) + (e.vision ? ' · has pictures, so only engines with vision could take it' : '') }, route(e) + (e.vision ? ' · vision' : '')),
     h('td', { class: 'r' }, toks(e.prompt_tokens)),
     h('td', { class: 'r c-cached' }, e.prompt_tokens ? Math.round((100 * e.cached_tokens) / e.prompt_tokens) + '%' : '–'),
     h('td', { class: 'r' }, e.queued ? dur(e.wait_ms) : '–'),

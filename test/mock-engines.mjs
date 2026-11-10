@@ -28,6 +28,7 @@ export function makeEngine(name, port, batch = 2, latencyMs = 300) {
     metricsHangup: false,
     reportIdle: false,
     noBatch: false,
+    images: false,
     unloaded: false,
     apiKey: '',
     prefillMs: 0,
@@ -72,7 +73,7 @@ export function makeEngine(name, port, batch = 2, latencyMs = 300) {
       }
       const p = engine.parks;
       json(res, 200, {
-        engine: { model: 'fake', version: '0.0-mock', ...(engine.noBatch ? {} : { batch_slots: batch }), vram_free_mib: 1000 },
+        engine: { model: 'fake', version: '0.0-mock', ...(engine.noBatch ? {} : { batch_slots: batch }), vram_free_mib: 1000, images: engine.images },
         live,
         conversation_cache: {
           enabled: true, budget_mib: 32768, slots: 8, parked: Math.min(8, p), parks: p, restores: 0, evictions: Math.max(0, p - 8),

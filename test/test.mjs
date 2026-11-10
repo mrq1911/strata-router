@@ -1083,6 +1083,72 @@ await scenario('engine view', async () => {
   check('an engine that stopped answering polls shows no stale work', down.every((b) => !b.healthy && b.running === 0 && b.activity.length === 0), JSON.stringify(down.map((b) => [b.name, b.healthy, b.running, b.activity.length])));
 });
 
+await scenario('pictures go to engines with vision', async () => {
+  const A = await engine('A');
+  const B = await engine('B');
+  B.images = true;
+  const r = await router([A, B]);
+  await sleep(300);
+  const st0 = (await get(r, '/stats')).backends;
+  check('/stats says which engines read pictures', st0.find((b) => b.name === 'A').images === false && st0.find((b) => b.name === 'B').images === true, JSON.stringify(st0.map((b) => [b.name, b.images])));
+
+  const png = 'iVBORw0KGgo=';
+  const picture = { type: 'image_url', image_url: { url: `data:image/png;base64,${png}` } };
+  const shots = await Promise.all([0, 1, 2].map((i) => chat(r, [{ role: 'user', content: [{ type: 'text', text: `what is in picture ${i}` }, picture] }])));
+  check('chat requests with an image part all wait for the vision engine, none spill', shots.every((x) => x.status === 200 && x.backend === 'B'), shots.map((x) => `${x.status} ${x.backend}`).join(' '));
+  check('a text request still goes anywhere', [200].includes((await chat(r, turns('plain text', 0))).status));
+
+  const routed = async (path, body) => {
+    const res = await post(r, path, { model: 'fake', max_tokens: 10, ...body });
+    await res.text();
+    return `${res.status} ${res.headers.get('x-strata-backend')}`;
+  };
+  const block = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: png } };
+  check('anthropic image blocks go to the vision engine', (await routed('/v1/messages', { messages: [{ role: 'user', content: [block, { type: 'text', text: 'describe' }] }] })) === '200 B');
+  check('a picture inside a tool result counts too', (await routed('/v1/messages', { messages: [
+    { role: 'user', content: 'take a screenshot' },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'screenshot', input: {} }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: [block] }] },
+  ] })) === '200 B');
+  check('responses api input_image goes to the vision engine', (await routed('/v1/responses', { input: [{ role: 'user', content: [{ type: 'input_text', text: 'what is this' }, { type: 'input_image', image_url: `data:image/png;base64,${png}` }] }] })) === '200 B');
+
+  B.metricsStatus = 503;
+  await sleep(300);
+  const first = await chat(r, turns('a text conversation that gets a picture later', 0));
+  check('with the vision engine down, text still goes to the text engine', first.status === 200 && first.backend === 'A', `${first.status} ${first.backend}`);
+  const t = Date.now();
+  const none = await chat(r, [{ role: 'user', content: [{ type: 'text', text: 'and this one?' }, picture] }]);
+  check('a picture with no vision engine up gets a clear 503, and soon', none.status === 503 && /vision/.test(none.error) && Date.now() - t < 5000, `${none.status} ${JSON.stringify(none.error)} after ${Date.now() - t} ms`);
+
+  B.metricsStatus = 200;
+  await sleep(300);
+  const later = await chat(r, [...turns('a text conversation that gets a picture later', 1), { role: 'user', content: [{ type: 'text', text: 'look' }, picture] }]);
+  check('a conversation at home on a text engine moves when a picture shows up', later.status === 200 && later.backend === 'B', `${later.status} ${later.backend}`);
+  const convs = (await get(r, '/stats/conversations')).conversations;
+  check('and it now lives on the vision engine', convs.some((c) => c.backend === 'B' && c.migrations >= 1), JSON.stringify(convs.map((c) => [c.backend, c.migrations])));
+  const evs = (await get(r, '/stats/events')).events;
+  check('events say which requests had pictures', evs.some((e) => e.vision && e.backend === 'B') && evs.some((e) => !e.vision && e.backend === 'A'), JSON.stringify(evs.slice(-4).map((e) => [e.backend, e.vision])));
+});
+
+await scenario('PREFER_BACKEND holds requests on one engine while it is up', async () => {
+  const A = await engine('A', 300);
+  const B = await engine('B', 100);
+  const r = await router([A, B], { PREFER_BACKEND: 'A' });
+  await sleep(300);
+  const got = await Promise.all([0, 1, 2].map((i) => chat(r, turns('preferred engine ' + i, 0))));
+  check('requests go to the preferred engine although the other is faster', got.every((x) => x.status === 200 && x.backend === 'A'), got.map((x) => `${x.status} ${x.backend}`).join(' '));
+  const header = await post(r, '/v1/chat/completions', { model: 'fake', messages: [{ role: 'user', content: 'explicit choice' }], max_tokens: 10 }, { headers: { 'content-type': 'application/json', 'x-strata-prefer': 'B' } });
+  check('the x-strata-prefer header beats the default', header.headers.get('x-strata-backend') === 'B', header.headers.get('x-strata-backend'));
+  A.metricsStatus = 503;
+  await sleep(400);
+  const fallback = await chat(r, turns('while the preferred one is down', 1));
+  check('a preferred engine that is down falls back to the other', fallback.status === 200 && fallback.backend === 'B', `${fallback.status} ${fallback.backend}`);
+  check('/stats names the configured preference', (await get(r, '/stats')).preferred === 'A', JSON.stringify((await get(r, '/stats')).preferred));
+  const bad = await router([A, B], { PREFER_BACKEND: 'nope' });
+  await sleep(200);
+  check('a preference naming an engine that is not configured stops the router at startup', bad.child.exitCode === 1 && bad.stderr.includes('PREFER_BACKEND'), bad.stderr.trim());
+});
+
 for (const child of routers) child.kill('SIGKILL');
 for (const e of engines) {
   e.server.closeAllConnections();

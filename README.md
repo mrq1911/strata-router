@@ -38,6 +38,7 @@ STRATA_BACKENDS="a=10.0.0.1:8080,b=10.0.0.2:8080" node router.mjs
 | `MAX_INFLIGHT` | `2` | per-engine cap; the router uses the smaller of this and the engine's reported batch slots (one when it has none) |
 | `MAX_QUEUE_WAIT` | `30000` | how long to wait for a free slot before handing the request to an engine's own queue |
 | `PREFILL_TOK_S` | `1400` | cold prefill speed until an engine's own is measured; decides how long a conversation waits for its busy home |
+| `PREFER_BACKEND` | — | engine name every request tries first; the others only when it is down or has unloaded its model |
 | `SHORT_PROMPT_TOKENS` | `2048` | requests under this many prompt tokens (estimated from the request size) take a freed slot first; `0` keeps plain arrival order |
 | `SLOW_FIRST_TOKEN` | `10000` | flag a first token later than this many ms that also took 3x what its uncached prompt needs |
 | `CONNECT_TIMEOUT` | `10000` | TCP connect timeout to an engine; a failed connect marks it unhealthy until the next good poll |
@@ -97,6 +98,16 @@ a bad value stops the router at startup with a message naming it, rather than ro
   side request summarizing a turn) go first, ahead of longer ones that have waited less than 5 s: a short request
   usually gives its slot back quickly, where waiting behind a long one costs it a whole turn. Likewise a long
   request about to take a slot that a waiting short one could use lets it go first, once, within its first 5 s.
+- **pictures** go only to engines whose `/metrics` says `engine.images: true` (strata with its vision reader on;
+  the shims say false). A request counts as one with pictures when its history has an `image_url` or
+  `input_image` part, or an anthropic `image` block (also inside a `tool_result`); the whole history is sent every
+  turn, so a conversation that ever had a picture keeps needing vision, and one at home on a text-only engine moves.
+  It waits for a vision engine like any other request (never spilling to a text-only one); with none up it gets a
+  503 `no healthy backend with vision` after about one poll, while text requests carry on.
+- **preference**: `PREFER_BACKEND=<name>` sends everything to that engine while it is up, and one request can
+  override it with the `x-strata-prefer: <name>` header. A preferred engine that is merely full is waited for up
+  to `MAX_QUEUE_WAIT` and then queued on that engine itself rather than spilled; only when it is unreachable, has
+  unloaded its model, or cannot read the pictures in the request does the request fall back to the usual routing.
 - **direct use** counts: requests a client sends to an engine directly, not through the router, take its slots too.
   Each poll compares the requests the engine says it runs with the ones the router sent (one the router finished
   while the poll was out still counts as its own), and requests seen twice in a row beyond those count as taken
